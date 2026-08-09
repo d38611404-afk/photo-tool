@@ -9,9 +9,10 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from PIL import Image
 
-app = FastAPI(title="商丘情趣王一手科技 - 在线图片处理器")
+app = FastAPI(title="在线图片处理器")
 
-# ---------------- 1. 模拟用户与任务数据库 ----------------
+# ---------------- 1. 用户与任务数据库 ----------------
+# 说明：账号密码在后台管理，前端页面不再显示
 USERS_DB = {
     "admin": {"username": "admin", "password": "adminpassword", "role": "admin"},
     "user1": {"username": "user1", "password": "123", "role": "user"},
@@ -24,10 +25,10 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/login")
 
 def get_current_user(token: str = Depends(oauth2_scheme)):
     if token not in TOKENS_DB:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="无效或已过期的 Token")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="身份认证已过期，请重新登录")
     return USERS_DB[TOKENS_DB[token]]
 
-# ---------------- 2. 核心图像处理逻辑 ----------------
+# ---------------- 2. 图像处理核心逻辑 ----------------
 def find_and_modify_height(data, original_height):
     sof_markers = [0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF]
     i = 0
@@ -132,6 +133,24 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     TOKENS_DB[token] = user["username"]
     return {"access_token": token, "token_type": "bearer", "role": user["role"], "username": user["username"]}
 
+@app.post("/api/admin/kickout")
+async def kickout_user(username: str = Form(...), current_user: dict = Depends(get_current_user)):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="无权限操作")
+    if username == "admin":
+        raise HTTPException(status_code=400, detail="不能下线管理员自己")
+    
+    tokens_to_remove = [token for token, user in TOKENS_DB.items() if user == username]
+    for token in tokens_to_remove:
+        del TOKENS_DB[token]
+    return {"message": f"已成功将用户 {username} 强制下线"}
+
+@app.get("/api/admin/online-users")
+async def get_online_users(current_user: dict = Depends(get_current_user)):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="无权限")
+    return {"online_users": list(set(TOKENS_DB.values()))}
+
 @app.post("/api/tasks/create")
 async def create_task(file: UploadFile = File(...), junk_size_mb: float = Form(1.0), current_user: dict = Depends(get_current_user)):
     task_id = str(uuid.uuid4())[:8]
@@ -165,7 +184,7 @@ async def stop_task(task_id: str, current_user: dict = Depends(get_current_user)
     task = TASKS_DB.get(task_id)
     if not task: raise HTTPException(status_code=404, detail="任务不存在")
     if current_user["role"] != "admin" and task["username"] != current_user["username"]:
-        raise HTTPException(status_code=403, detail="无权限停止他人任务")
+        raise HTTPException(status_code=403, detail="无权限")
     task["stop_requested"] = True
     task["status"] = "正在停止..."
     return {"message": "已发送停止信号"}
@@ -180,7 +199,7 @@ async def download_task_file(task_id: str, current_user: dict = Depends(get_curr
     base_name, _ = os.path.splitext(task["filename"])
     return FileResponse(task["result_path"], filename=f"{base_name}.file")
 
-# ---------------- 4. 嵌入网页界面 ----------------
+# ---------------- 4. 前端页面 ----------------
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
     return """
@@ -188,97 +207,140 @@ async def serve_index():
     <html lang="zh-CN">
     <head>
         <meta charset="UTF-8">
-        <title>商丘情趣王一手科技 - 在线处理控制台</title>
+        <title>在线图片处理系统</title>
         <style>
-            body { font-family: sans-serif; margin: 30px; background: #f4f4f9; }
-            .card { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 30px; background: #f4f4f9; }
+            .card { background: white; padding: 25px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); max-width: 900px; margin-left: auto; margin-right: auto; }
             .hidden { display: none; }
-            table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-            th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-            th { background-color: #f2f2f2; }
-            .btn-danger { background-color: #f44336; color: white; border: none; padding: 5px 10px; cursor: pointer; border-radius: 3px; }
-            .btn-success { background-color: #4CAF50; color: white; border: none; padding: 5px 10px; cursor: pointer; border-radius: 3px; }
-            button { cursor: pointer; padding: 6px 12px; }
+            input[type="text"], input[type="password"] { padding: 8px 12px; border: 1px solid #ccc; border-radius: 4px; margin-right: 10px; }
+            table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+            th, td { border: 1px solid #eee; padding: 10px; text-align: left; }
+            th { background-color: #f8f9fa; }
+            .btn { padding: 6px 14px; border: none; border-radius: 4px; cursor: pointer; font-weight: 500; }
+            .btn-primary { background-color: #0066cc; color: white; }
+            .btn-danger { background-color: #dc3545; color: white; }
+            .btn-success { background-color: #28a745; color: white; }
         </style>
     </head>
     <body>
         <div id="loginCard" class="card">
-            <h2>商丘情趣王一手科技 - 系统登录</h2>
-            <p style="color:#666;">
-                <b>管理员账号：</b>admin / adminpassword<br>
-                <b>普通用户账号：</b>user1 / 123
-            </p >
-            <input type="text" id="loginUsername" placeholder="用户名">
-            <input type="password" id="loginPassword" placeholder="密码">
-            <button onclick="login()">登录</button>
+            <h2>系统登录</h2>
+            <div style="margin-top: 15px;">
+                <input type="text" id="loginUsername" placeholder="请输入用户名">
+                <input type="password" id="loginPassword" placeholder="请输入密码">
+                <button class="btn btn-primary" onclick="login()">登录</button>
+            </div>
         </div>
 
         <div id="mainCard" class="card hidden">
-            <h2>控制台 - 当前用户: <span id="userInfo"></span></h2>
-            <button onclick="logout()">退出登录</button><hr>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h2>控制台 - 当前用户: <span id="userInfo"></span></h2>
+                <button class="btn btn-danger" onclick="logout()">退出登录</button>
+            </div>
+            <hr style="border:0; border-top:1px solid #eee; margin: 15px 0;">
             
-            <h3>提交 JPEG 图片</h3>
-            <input type="file" id="imageFile" accept=".jpg,.jpeg,.jpe,.jfif">
-            垃圾数据大小 (MB): <input type="number" id="junkSize" value="1.0" step="0.5" style="width:60px;">
-            <button onclick="submitTask()">开始处理</button>
+            <h3>上传 JPEG 图片</h3>
+            <div>
+                <input type="file" id="imageFile" accept=".jpg,.jpeg,.jpe,.jfif">
+                垃圾数据 (MB): <input type="number" id="junkSize" value="1.0" step="0.5" style="width:60px;">
+                <button class="btn btn-primary" onclick="submitTask()">开始处理</button>
+            </div>
 
-            <h3>任务管理中心 <button onclick="fetchTasks()">手动刷新</button></h3>
+            <h3 style="margin-top: 30px;">任务列表</h3>
             <table>
                 <thead>
-                    <tr><th>任务 ID</th><th>用户</th><th>文件名</th><th>状态</th><th>创建时间</th><th>操作</th></tr>
+                    <tr><th>任务 ID</th><th>所属用户</th><th>文件名</th><th>状态</th><th>创建时间</th><th>操作</th></tr>
                 </thead>
                 <tbody id="taskTableBody"></tbody>
             </table>
+
+            <div id="adminPanel" class="hidden" style="margin-top: 30px; border-top: 2px dashed #eee; padding-top: 15px;">
+                <h3>在线用户管理（管理员专属）</h3>
+                <ul id="onlineUsersList" style="padding-left: 20px;"></ul>
+            </div>
         </div>
 
         <script>
             let currentUser = null, pollInterval = null;
+
             window.onload = () => {
                 const token = localStorage.getItem("token");
                 if (token) {
-                    currentUser = { token, role: localStorage.getItem("role"), username: localStorage.getItem("username") };
+                    currentUser = {
+                        token,
+                        role: localStorage.getItem("role"),
+                        username: localStorage.getItem("username")
+                    };
                     showMainUI();
                 }
             };
+
             async function login() {
                 const u = document.getElementById("loginUsername").value;
                 const p = document.getElementById("loginPassword").value;
+                if(!u || !p) return alert("请输入用户名和密码");
+
                 const body = new URLSearchParams({ username: u, password: p });
                 const res = await fetch('/api/login', { method: "POST", body });
                 const data = await res.json();
+                
                 if (!res.ok) return alert("登录失败: " + data.detail);
+
                 currentUser = { token: data.access_token, role: data.role, username: data.username };
                 localStorage.setItem("token", data.access_token);
                 localStorage.setItem("role", data.role);
                 localStorage.setItem("username", data.username);
                 showMainUI();
             }
+
             function logout() {
-                localStorage.clear(); currentUser = null; clearInterval(pollInterval);
+                localStorage.clear();
+                currentUser = null;
+                clearInterval(pollInterval);
                 document.getElementById("loginCard").classList.remove("hidden");
                 document.getElementById("mainCard").classList.add("hidden");
             }
+
             function showMainUI() {
                 document.getElementById("loginCard").classList.add("hidden");
                 document.getElementById("mainCard").classList.remove("hidden");
-                document.getElementById("userInfo").innerText = `${currentUser.username} (${currentUser.role === 'admin' ? '总管理员' : '普通用户'})`;
+                document.getElementById("userInfo").innerText = `${currentUser.username} (${currentUser.role === 'admin' ? '管理员' : '普通用户'})`;
+                
+                if(currentUser.role === 'admin') {
+                    document.getElementById("adminPanel").classList.remove("hidden");
+                }
+
                 fetchTasks();
+                fetchOnlineUsers();
                 clearInterval(pollInterval);
-                pollInterval = setInterval(fetchTasks, 2000);
+                pollInterval = setInterval(() => {
+                    fetchTasks();
+                    fetchOnlineUsers();
+                }, 2000);
             }
+
             async function submitTask() {
                 const file = document.getElementById("imageFile").files[0];
-                if (!file) return alert("请选择文件！");
+                if (!file) return alert("请选择要处理的图片文件！");
                 const formData = new FormData();
                 formData.append("file", file);
                 formData.append("junk_size_mb", document.getElementById("junkSize").value);
-                const res = await fetch('/api/tasks/create', { method: "POST", headers: { "Authorization": `Bearer ${currentUser.token}` }, body: formData });
+
+                const res = await fetch('/api/tasks/create', {
+                    method: "POST",
+                    headers: { "Authorization": `Bearer ${currentUser.token}` },
+                    body: formData
+                });
                 if (res.ok) { fetchTasks(); } else { alert("提交失败"); }
             }
+
             async function fetchTasks() {
                 if (!currentUser) return;
                 const res = await fetch('/api/tasks', { headers: { "Authorization": `Bearer ${currentUser.token}` } });
-                if (!res.ok) return;
+                if (!res.ok) {
+                    if(res.status === 401) logout();
+                    return;
+                }
                 const tasks = await res.json();
                 const tbody = document.getElementById("taskTableBody");
                 tbody.innerHTML = "";
@@ -287,18 +349,47 @@ async def serve_index():
                     const isRunning = t.status === "排队中" || t.status === "处理中";
                     let btn = "";
                     if (isRunning && (isAdmin || isOwner)) {
-                        btn += `<button class="btn-danger" onclick="stopTask('${t.task_id}')">${isAdmin && !isOwner ? '强行停止(管理员)' : '停止'}</button> `;
+                        btn += `<button class="btn btn-danger" onclick="stopTask('${t.task_id}')">停止</button> `;
                     }
                     if (t.status === "已完成") {
-                        btn += `<button class="btn-success" onclick="downloadFile('${t.task_id}')">下载 .file</button>`;
+                        btn += `<button class="btn btn-success" onclick="downloadFile('${t.task_id}')">下载结果</button>`;
                     }
                     tbody.innerHTML += `<tr><td>${t.task_id}</td><td><b>${t.username}</b></td><td>${t.filename}</td><td>${t.status}</td><td>${t.created_at}</td><td>${btn}</td></tr>`;
                 });
             }
+
+            async function fetchOnlineUsers() {
+                if (!currentUser || currentUser.role !== 'admin') return;
+                const res = await fetch('/api/admin/online-users', { headers: { "Authorization": `Bearer ${currentUser.token}` } });
+                if (!res.ok) return;
+                const data = await res.json();
+                const list = document.getElementById("onlineUsersList");
+                list.innerHTML = "";
+                data.online_users.forEach(user => {
+                    if(user !== 'admin') {
+                        list.innerHTML += `<li style="margin-bottom:8px;">${user} <button class="btn btn-danger" style="padding:2px 8px; font-size:12px;" onclick="kickout('${user}')">强行下线</button></li>`;
+                    }
+                });
+            }
+
+            async function kickout(username) {
+                const formData = new FormData();
+                formData.append("username", username);
+                const res = await fetch('/api/admin/kickout', {
+                    method: "POST",
+                    headers: { "Authorization": `Bearer ${currentUser.token}` },
+                    body: formData
+                });
+                const data = await res.json();
+                alert(data.message);
+                fetchOnlineUsers();
+            }
+
             async function stopTask(id) {
                 await fetch(`/api/tasks/${id}/stop`, { method: "POST", headers: { "Authorization": `Bearer ${currentUser.token}` } });
                 fetchTasks();
             }
+
             async function downloadFile(id) {
                 const res = await fetch(`/api/tasks/${id}/download`, { headers: { "Authorization": `Bearer ${currentUser.token}` } });
                 const blob = await res.blob();
