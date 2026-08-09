@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from PIL import Image
 
-app = FastAPI(title="在线图片处理系统 - 极速直链下载版")
+app = FastAPI(title="在线图片处理系统 - 自动ZIP进度版")
 
 # ---------------- 1. 用户与任务数据库 ----------------
 USERS_DB = {
@@ -101,7 +101,6 @@ def background_process_image(task_id: str, input_path: str, output_path: str, ju
         chunk_size = 1024 * 512
         added = 0
         
-        # 使用 os.urandom 极速添加字节
         while added < junk_size_bytes:
             if task["stop_requested"]:
                 task["status"] = "已取消"
@@ -147,7 +146,6 @@ async def login(
     TOKENS_DB[token] = user["username"]
     return {"access_token": token, "token_type": "bearer", "role": user["role"], "username": user["username"]}
 
-# 管理员路由
 @app.get("/api/admin/users")
 async def list_all_users(current_user: dict = Depends(get_current_user)):
     if current_user["role"] != "admin":
@@ -224,7 +222,6 @@ async def get_online_users(current_user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="无权限")
     return {"online_users": list(set(TOKENS_DB.values()))}
 
-# 任务处理路由
 @app.post("/api/tasks/create_batch")
 async def create_batch_tasks(files: List[UploadFile] = File(...), junk_size_mb: float = Form(1.0), current_user: dict = Depends(get_current_user)):
     task_ids = []
@@ -261,7 +258,6 @@ async def list_tasks(current_user: dict = Depends(get_current_user)):
         return list(TASKS_DB.values())
     return [t for t in TASKS_DB.values() if t["username"] == current_user["username"]]
 
-# 【修改为支持 Query 参数传参的打包下载】
 @app.get("/api/tasks/download_zip")
 async def download_zip(token: str = None):
     if not token or token not in TOKENS_DB:
@@ -307,7 +303,6 @@ async def stop_task(task_id: str, current_user: dict = Depends(get_current_user)
     task["status"] = "正在停止..."
     return {"message": "已发送停止信号"}
 
-# 【修改为支持 Query 参数传参的单文件下载】
 @app.get("/api/tasks/{task_id}/download")
 async def download_task_file(task_id: str, token: str = None):
     if not token or token not in TOKENS_DB:
@@ -329,7 +324,7 @@ async def serve_index():
     <html lang="zh-CN">
     <head>
         <meta charset="UTF-8">
-        <title>在线图片处理系统 - 直链下载版</title>
+        <title>在线图片处理系统 - 自动ZIP下载版</title>
         <style>
             body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 30px; background: #f4f4f9; }
             .card { background: white; padding: 25px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); max-width: 950px; margin-left: auto; margin-right: auto; }
@@ -373,9 +368,9 @@ async def serve_index():
             </div>
 
             <div class="toolbar" style="margin-top: 25px;">
-                <h3 style="margin: 0;">任务列表 (处理完成自动下载)</h3>
+                <h3 style="margin: 0;">任务列表 (完成自动打包下载)</h3>
                 <div>
-                    <button class="btn btn-success" onclick="downloadZip()">📦 打包下载全部已完成 (.zip)</button>
+                    <button id="zipBtn" class="btn btn-success" onclick="downloadZip()">📦 打包下载全部已完成 (.zip)</button>
                     <button class="btn btn-warning" onclick="clearTasks()">🧹 刷新/清除所有记录</button>
                 </div>
             </div>
@@ -413,7 +408,7 @@ async def serve_index():
 
         <script>
             let currentUser = null, pollInterval = null;
-            let autoDownloadedTasks = new Set();
+            let hasAutoDownloadedZip = false; // 批次下载锁标志
 
             function getDeviceId() {
                 let deviceId = localStorage.getItem("system_device_fingerprint");
@@ -579,6 +574,8 @@ async def serve_index():
                 btn.innerText = "⏳ 批量上传与处理中...";
                 btn.disabled = true;
 
+                hasAutoDownloadedZip = false; // 重置 ZIP 自动下载标志
+
                 const formData = new FormData();
                 for(let i = 0; i < files.length; i++) formData.append("files", files[i]);
                 formData.append("junk_size_mb", document.getElementById("junkSize").value);
@@ -607,6 +604,15 @@ async def serve_index():
                 const tbody = document.getElementById("taskTableBody");
                 tbody.innerHTML = "";
                 
+                let myTasks = tasks.filter(t => t.username === currentUser.username);
+                let completedCount = myTasks.filter(t => t.status === "已完成").length;
+
+                // 判断：当有属于自己的任务，且全部达到“已完成”时，自动触发打包 ZIP 下载
+                if (myTasks.length > 0 && completedCount === myTasks.length && !hasAutoDownloadedZip) {
+                    hasAutoDownloadedZip = true;
+                    downloadZip();
+                }
+
                 tasks.forEach(t => {
                     const isOwner = t.username === currentUser.username, isAdmin = currentUser.role === "admin";
                     const isRunning = t.status === "排队中" || t.status === "处理中";
@@ -617,11 +623,6 @@ async def serve_index():
                     }
                     if (t.status === "已完成") {
                         btn += `<button class="btn btn-success" onclick="downloadFile('${t.task_id}')">单文件下载</button>`;
-                        
-                        if (isOwner && !autoDownloadedTasks.has(t.task_id)) {
-                            autoDownloadedTasks.add(t.task_id);
-                            downloadFile(t.task_id);
-                        }
                     }
                     tbody.innerHTML += `<tr><td>${t.task_id}</td><td><b>${t.username}</b></td><td>${t.filename}</td><td>${t.status}</td><td>${t.created_at}</td><td>${btn}</td></tr>`;
                 });
@@ -636,22 +637,69 @@ async def serve_index():
                 if(!confirm("确定要刷新并清除当前列表及服务器上的所有临时文件吗？")) return;
                 const res = await fetch('/api/tasks/clear', { method: "POST", headers: { "Authorization": `Bearer ${currentUser.token}` } });
                 if(res.ok) {
-                    autoDownloadedTasks.clear();
+                    hasAutoDownloadedZip = false;
                     fetchTasks();
                 }
             }
 
-            // 【完全采用浏览器原生直链调起，零拦截】
             function downloadFile(id) {
                 const token = localStorage.getItem("token");
                 if(!token) return alert("身份校验已失效，请重新登录");
                 window.open(`/api/tasks/${id}/download?token=${token}`, '_blank');
             }
 
+            // 【重点功能】：带有进度提示的 ZIP 打包下载逻辑
             function downloadZip() {
                 const token = localStorage.getItem("token");
                 if(!token) return alert("身份校验已失效，请重新登录");
-                window.open(`/api/tasks/download_zip?token=${token}`, '_blank');
+
+                const zipBtn = document.getElementById("zipBtn");
+                zipBtn.disabled = true;
+                zipBtn.innerText = "⏳ 正在生成打包压缩包...";
+
+                const xhr = new XMLHttpRequest();
+                xhr.open("GET", `/api/tasks/download_zip?token=${token}`, true);
+                xhr.responseType = "blob";
+
+                // 监听进度事件
+                xhr.onprogress = function(e) {
+                    if (e.lengthComputable) {
+                        const percent = Math.round((e.loaded / e.total) * 100);
+                        zipBtn.innerText = `⏬ 正在打包下载 ${percent}%...`;
+                    } else {
+                        zipBtn.innerText = `⏬ 正在传输打包数据 (${(e.loaded / (1024*1024)).toFixed(1)} MB)...`;
+                    }
+                };
+
+                xhr.onload = function() {
+                    if (this.status === 200) {
+                        const blob = this.response;
+                        const url = window.URL.createObjectURL(blob);
+                        const a = document.createElement("a");
+                        a.style.display = "none";
+                        a.href = url;
+                        a.download = `批量图片包_${new Date().getTime()}.zip`;
+                        document.body.appendChild(a);
+                        a.click();
+                        
+                        setTimeout(() => {
+                            document.body.removeChild(a);
+                            window.URL.revokeObjectURL(url);
+                        }, 1000);
+                    } else {
+                        alert("打包下载失败或没有可供下载的文件！");
+                    }
+                    zipBtn.disabled = false;
+                    zipBtn.innerText = "📦 打包下载全部已完成 (.zip)";
+                };
+
+                xhr.onerror = function() {
+                    alert("网络错误，打包下载中断！");
+                    zipBtn.disabled = false;
+                    zipBtn.innerText = "📦 打包下载全部已完成 (.zip)";
+                };
+
+                xhr.send();
             }
         </script>
     </body>
