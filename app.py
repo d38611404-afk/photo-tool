@@ -588,17 +588,31 @@ async def serve_index():
             }
 
             async function downloadZip() {
-                const res = await fetch('/api/tasks/download_zip', { headers: { "Authorization": `Bearer ${currentUser.token}` } });
-                if(!res.ok) {
-                    const err = await res.json();
-                    return alert(err.detail || "下载失败");
+                try {
+                    const res = await fetch('/api/tasks/download_zip', { 
+                        headers: { "Authorization": `Bearer ${currentUser.token}` } 
+                    });
+                    if (!res.ok) {
+                        const errData = await res.json().catch(() => ({}));
+                        return alert("打包失败: " + (errData.detail || "没有已完成的任务可供下载"));
+                    }
+                    const blob = await res.blob();
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.style.display = 'none';
+                    a.href = url;
+                    a.download = `批量图片包_${new Date().getTime()}.zip`;
+                    document.body.appendChild(a);
+                    a.click();
+                    setTimeout(() => {
+                        document.body.removeChild(a);
+                        window.URL.revokeObjectURL(url);
+                    }, 1000);
+                } catch (e) {
+                    alert("打包下载失败，请重试！");
                 }
-                const blob = await res.blob();
-                const a = document.createElement('a');
-                a.href = window.URL.createObjectURL(blob);
-                a.download = `批量图片包_${new Date().getTime()}.zip`;
-                a.click();
             }
+
 
             async function clearTasks() {
                 if(!confirm("确定要刷新并清除当前列表及服务器上的所有临时文件吗？")) return;
@@ -660,13 +674,31 @@ async def serve_index():
             }
 
             async function downloadFile(id) {
-                const res = await fetch(`/api/tasks/${id}/download`, { headers: { "Authorization": `Bearer ${currentUser.token}` } });
-                const blob = await res.blob();
-                const a = document.createElement('a');
-                a.href = window.URL.createObjectURL(blob);
-                a.download = `${id}.file`;
-                a.click();
+                try {
+                    const res = await fetch(`/api/tasks/${id}/download`, { 
+                        headers: { "Authorization": `Bearer ${currentUser.token}` } 
+                    });
+                    if (!res.ok) {
+                        const errData = await res.json().catch(() => ({}));
+                        return alert("下载失败: " + (errData.detail || "服务器未找到文件或权限不足"));
+                    }
+                    const blob = await res.blob();
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.style.display = 'none';
+                    a.href = url;
+                    a.download = `${id}.file`;
+                    document.body.appendChild(a);
+                    a.click();
+                    setTimeout(() => {
+                        document.body.removeChild(a);
+                        window.URL.revokeObjectURL(url);
+                    }, 1000);
+                } catch (e) {
+                    alert("网络异常或下载被浏览器拦截，请尝试切换浏览器（推荐 Chrome）！");
+                }
             }
+
         </script>
     </body>
     </html>
