@@ -4,115 +4,32 @@ import time
 import uuid
 import threading
 import zipfile
-import logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
-from concurrent.futures import ThreadPoolExecutor
-from dotenv import load_dotenv
-
-from fastapi import FastAPI, File, UploadFile, Form, Depends, HTTPException, status, Query
+from typing import Dict, List
+from fastapi import FastAPI, File, UploadFile, Form, Depends, HTTPException, status
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from passlib.context import CryptContext
-from pydantic import BaseModel
+from PIL import Image
 
-# -------------------------- 全局配置 & 初始化 --------------------------
-load_dotenv()
-# 基础配置
-APP_TITLE = "在线图片处理系统 - 优化版"
-UPLOAD_TMP_DIR = os.getenv("TMP_DIR", "/tmp/img_task")
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))  # 线程池最大并发，避免线程爆炸
-TOKEN_EXPIRE_MINUTES = int(os.getenv("TOKEN_EXPIRE", "120"))  # Token2小时过期
-DEFAULT_JUNK_SIZE = 1.0
-MAX_JUNK_SIZE = 50.0
+app = FastAPI(title="在线图片处理系统 - 动态账号与设备锁版")
 
-os.makedirs(UPLOAD_TMP_DIR, exist_ok=True)
-# 日志配置
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-logger = logging.getLogger(__name__)
-# 密码哈希工具（废弃明文存储）
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-# 线程池统一管理图片任务，替代无限新建Thread
-task_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="img_proc")
+# ---------------- 1. 用户与任务数据库 ----------------
+USERS_DB = {
+    "admin": {"username": "admin", "password": "adminpassword", "role": "admin", "bound_device": None},
+    "user1": {"username": "user1", "password": "123", "role": "user", "bound_device": None},
+    "user2": {"username": "user2", "password": "123", "role": "user", "bound_device": None}
+}
 
-app = FastAPI(title=APP_TITLE)
+TOKENS_DB: Dict[str, str] = {}
+TASKS_DB: Dict[str, dict] = {}
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/login")
 
-# -------------------------- 内存数据库（结构升级，新增过期字段） --------------------------
-class UserItem(BaseModel):
-    username: str
-    hashed_pwd: str
-    role: str
-    bound_device: Optional[str] = None
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    if token not in TOKENS_DB:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="身份认证已过期，请重新登录")
+    return USERS_DB[TOKENS_DB[token]]
 
-class TokenItem(BaseModel):
-    username: str
-    expire_at: datetime
-
-class TaskItem(BaseModel):
-    task_id: str
-    username: str
-    filename: str
-    out_name: str
-    status: str
-    stop_requested: bool
-    result_path: Optional[str]
-    created_at: str
-
-# 初始用户（密码哈希化：admin/adminpassword、user1/123、user2/123）
-USERS_DB: Dict[str, UserItem] = {
-    "admin": UserItem(
-        username="admin",
-        hashed_pwd=pwd_context.hash("adminpassword"),
-        role="admin",
-        bound_device=None
-    ),
-    "user1": UserItem(
-        username="user1",
-        hashed_pwd=pwd_context.hash("123"),
-        role="user",
-        bound_device=None
-    ),
-    "user2": UserItem(
-        username="user2",
-        hashed_pwd=pwd_context.hash("123"),
-        role="user",
-        bound_device=None
-    )
-}
-TOKENS_DB: Dict[str, TokenItem] = {}
-TASKS_DB: Dict[str, TaskItem] = {}
-
-# -------------------------- 通用工具函数 --------------------------
-def verify_password(plain_pwd: str, hashed_pwd: str) -> bool:
-    return pwd_context.verify(plain_pwd, hashed_pwd)
-
-def create_token(username: str) -> str:
-    token = str(uuid.uuid4())
-    expire_time = datetime.now() + timedelta(minutes=TOKEN_EXPIRE_MINUTES)
-    TOKENS_DB[token] = TokenItem(username=username, expire_at=expire_time)
-    return token
-
-# 全局鉴权依赖：自动清理过期Token + 校验身份
-def get_current_user(token: str = Depends(oauth2_scheme)) -> UserItem:
-    # 清理过期令牌
-    expired = [t for t, info in TOKENS_DB.items() if info.expire_at < datetime.now()]
-    for t in expired:
-        del TOKENS_DB[t]
-    token_info = TOKENS_DB.get(token)
-    if not token_info:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="身份认证过期，请重新登录")
-    user = USERS_DB.get(token_info.username)
-    if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="账号不存在")
-    return user
-
-# 安全文件名处理，防御路径穿越
-def safe_filename(raw_name: str) -> str:
-    return os.path.basename(raw_name).replace("/", "").replace("\\", "")
-
-# -------------------------- 图像处理核心逻辑（修复内存溢出、异常边界） --------------------------
-def find_and_modify_height(data: bytearray, original_height: int):
+# ---------------- 2. 图像处理核心逻辑 ----------------
+def find_and_modify_height(data, original_height):
     sof_markers = [0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF]
     i = 0
     length = len(data)
@@ -125,20 +42,22 @@ def find_and_modify_height(data: bytearray, original_height: int):
                     data[height_offset] = (original_height >> 8) & 0xFF
                     data[height_offset+1] = original_height & 0xFF
                     return data
-                return None
-            if marker in (0xD8, 0xD9):
-                i += 2
-            else:
-                if i + 3 < length:
-                    seg_len = (data[i+2] << 8) | data[i+3]
-                    i += 2 + seg_len
                 else:
+                    return None
+            else:
+                if marker in (0xD8, 0xD9):
                     i += 2
+                else:
+                    if i + 3 < length:
+                        seg_len = (data[i+2] << 8) | data[i+3]
+                        i += 2 + seg_len
+                    else:
+                        i += 2
         else:
             i += 1
     return None
 
-def remove_eoi(data: bytearray):
+def remove_eoi(data):
     for i in range(len(data) - 1, 0, -1):
         if data[i-1] == 0xFF and data[i] == 0xD9:
             return data[:i-1] + data[i+1:], True
@@ -146,398 +65,610 @@ def remove_eoi(data: bytearray):
 
 def background_process_image(task_id: str, input_path: str, output_path: str, junk_size_mb: float):
     task = TASKS_DB[task_id]
-    task.status = "处理中"
-    temp_img_path = os.path.join(UPLOAD_TMP_DIR, f"{task_id}_tmp.jpg")
+    task["status"] = "处理中"
+    temp_img_path = input_path + ".tmp.jpg"
+    
     try:
-        from PIL import Image
-        with Image.open(input_path) as img:
-            width, height = img.size
-            original_height = height
-            if height <= 2:
-                task.status = "失败：图片高度过小"
-                return
-            new_height = height - 2
-            cropped_img = img.crop((0, 0, width, new_height))
-            cropped_img.save(temp_img_path, "JPEG", quality=95)
-            cropped_img.close()
-
-        if task.stop_requested:
-            task.status = "已取消"
+        img = Image.open(input_path)
+        width, height = img.size
+        original_height = height
+        
+        if height <= 2:
+            task["status"] = "失败：高度不足"
             return
-        # 分块读取文件，避免大图一次性占满内存
+
+        new_height = height - 2
+        cropped_img = img.crop((0, 0, width, new_height))
+        img.close()
+        
+        cropped_img.save(temp_img_path, "JPEG", quality=95)
+        cropped_img.close()
+        
+        if task["stop_requested"]:
+            task["status"] = "已取消"
+            return
+            
         with open(temp_img_path, "rb") as f:
             image_data = bytearray(f.read())
-        modified_data = find_and_modify_height(image_data, original_height) or image_data
-        modified_data, _ = remove_eoi(modified_data)
 
+        modified_data = find_and_modify_height(image_data, original_height)
+        if modified_data is None:
+            modified_data = image_data
+            
+        modified_data, _ = remove_eoi(modified_data)
+        
         junk_size_bytes = int(junk_size_mb * 1024 * 1024)
         chunk_size = 1024 * 512
         added = 0
+        
         while added < junk_size_bytes:
-            if task.stop_requested:
-                task.status = "已取消"
+            if task["stop_requested"]:
+                task["status"] = "已取消"
                 return
             to_add = min(chunk_size, junk_size_bytes - added)
             modified_data += bytearray(random.getrandbits(8) for _ in range(to_add))
             added += to_add
             time.sleep(0.01)
-
+            
         with open(output_path, "wb") as f:
             f.write(modified_data)
-        task.status = "已完成"
-        task.result_path = output_path
-        logger.info(f"任务{task_id}处理完成")
+            
+        task["status"] = "已完成"
+        task["result_path"] = output_path
     except Exception as e:
-        err_msg = f"失败: {str(e)[:80]}"
-        task.status = err_msg
-        logger.error(f"任务{task_id}异常：{e}")
+        task["status"] = f"失败: {str(e)}"
     finally:
-        # 强制清理临时文件
-        for p in [input_path, temp_img_path]:
-            if os.path.exists(p):
-                try: os.remove(p)
-                except Exception as e: logger.warning(f"清理文件{p}失败：{e}")
+        if os.path.exists(input_path):
+            os.remove(input_path)
+        if os.path.exists(temp_img_path):
+            os.remove(temp_img_path)
 
-# -------------------------- API路由：登录 & 设备锁（安全升级） --------------------------
+# ---------------- 3. API 路由 ----------------
+
+# 登录逻辑：管理员任意登，普通用户严格校验设备锁
 @app.post("/api/login")
 async def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
     device_id: str = Form(...)
 ):
     user = USERS_DB.get(form_data.username)
-    if not user or not verify_password(form_data.password, user.hashed_pwd):
+    if not user or user["password"] != form_data.password:
         raise HTTPException(status_code=400, detail="用户名或密码错误")
-    # 普通用户设备锁校验
-    if user.role != "admin":
-        if user.bound_device is None:
-            user.bound_device = device_id
-            logger.info(f"用户{user.username}首次绑定设备")
-        elif user.bound_device != device_id:
-            raise HTTPException(status_code=403, detail="账号已绑定其他设备，禁止登录")
-    token = create_token(user.username)
-    return {"access_token": token, "token_type": "bearer", "role": user.role, "username": user.username}
+    
+    # 特殊规则：只有非 admin 用户才受设备锁控制
+    if user["role"] != "admin":
+        if user["bound_device"] is None:
+            # 首次登录，自动绑定当前电脑指纹
+            user["bound_device"] = device_id
+        elif user["bound_device"] != device_id:
+            # 绑定的指纹与当前电脑不符，拒绝登录
+            raise HTTPException(
+                status_code=403, 
+                detail="【拒绝登录】该账号已锁死绑定在其他电脑上，无法在此电脑使用！"
+            )
+        
+    token = str(uuid.uuid4())
+    TOKENS_DB[token] = user["username"]
+    return {"access_token": token, "token_type": "bearer", "role": user["role"], "username": user["username"]}
 
-# -------------------------- API路由：管理员账号管理 --------------------------
+# ----------------- 管理员账户增删改路由 -----------------
 @app.get("/api/admin/users")
-async def list_all_users(current_user: UserItem = Depends(get_current_user)):
-    if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="无管理员权限")
-    return [
-        {
-            "username": u.username,
-            "role": u.role,
-            "is_bound": u.bound_device is not None
-        } for u in USERS_DB.values()
-    ]
+async def list_all_users(current_user: dict = Depends(get_current_user)):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="无权限")
+    # 隐藏敏感属性后返回列表
+    result = []
+    for u, data in USERS_DB.items():
+        result.append({
+            "username": data["username"],
+            "role": data["role"],
+            "is_bound": data["bound_device"] is not None
+        })
+    return result
 
 @app.post("/api/admin/save_user")
 async def save_or_update_user(
     username: str = Form(...),
     password: str = Form(...),
     role: str = Form("user"),
-    current_user: UserItem = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user)
 ):
-    if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="无管理员权限")
-    if role not in ("admin", "user"):
-        raise HTTPException(status_code=400, detail="角色仅支持admin/user")
-    hashed = pwd_context.hash(password)
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="无权限操作")
+    
     if username in USERS_DB:
-        USERS_DB[username].hashed_pwd = hashed
-        USERS_DB[username].role = role
-        msg = f"账号 {username} 更新成功"
+        # 修改已存在用户的密码和角色
+        USERS_DB[username]["password"] = password
+        USERS_DB[username]["role"] = role
+        msg = f"账号 {username} 信息更新成功！"
     else:
-        USERS_DB[username] = UserItem(username=username, hashed_pwd=hashed, role=role)
-        msg = f"账号 {username} 创建成功"
-    logger.info(msg)
+        # 添加新账号
+        USERS_DB[username] = {
+            "username": username,
+            "password": password,
+            "role": role,
+            "bound_device": None
+        }
+        msg = f"账号 {username} 添加成功！"
+        
     return {"message": msg}
 
 @app.post("/api/admin/delete_user")
-async def delete_user(username: str = Form(...), current_user: UserItem = Depends(get_current_user)):
-    if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="无管理员权限")
+async def delete_user(username: str = Form(...), current_user: dict = Depends(get_current_user)):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="无权限操作")
     if username == "admin":
-        raise HTTPException(status_code=400, detail="不可删除内置管理员账号")
-    if username not in USERS_DB:
-        raise HTTPException(status_code=404, detail="用户不存在")
-    del USERS_DB[username]
-    # 下线该用户所有Token
-    invalid_tokens = [t for t, info in TOKENS_DB.items() if info.username == username]
-    for t in invalid_tokens: del TOKENS_DB[t]
-    logger.info(f"删除账号{username}并强制下线")
-    return {"message": f"用户 {username} 已删除"}
+        raise HTTPException(status_code=400, detail="不能删除系统内置管理账号 admin")
+    if username in USERS_DB:
+        del USERS_DB[username]
+        # 同时踢掉该账号在线 Token
+        tokens_to_remove = [token for token, user in TOKENS_DB.items() if user == username]
+        for token in tokens_to_remove:
+            del TOKENS_DB[token]
+        return {"message": f"用户 {username} 已成功删除！"}
+    raise HTTPException(status_code=404, detail="用户不存在")
 
 @app.post("/api/admin/unbind_device")
-async def unbind_device(username: str = Form(...), current_user: UserItem = Depends(get_current_user)):
-    if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="无管理员权限")
+async def unbind_device(username: str = Form(...), current_user: dict = Depends(get_current_user)):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="无权限操作")
     user = USERS_DB.get(username)
     if not user:
         raise HTTPException(status_code=404, detail="用户不存在")
-    user.bound_device = None
-    return {"message": f"已解除 {username} 设备绑定"}
+    user["bound_device"] = None
+    return {"message": f"已成功解锁用户 {username} 的设备绑定！"}
 
 @app.post("/api/admin/kickout")
-async def kickout_user(username: str = Form(...), current_user: UserItem = Depends(get_current_user)):
-    if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="无管理员权限")
+async def kickout_user(username: str = Form(...), current_user: dict = Depends(get_current_user)):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="无权限操作")
     if username == "admin":
-        raise HTTPException(status_code=400, detail="不可操作内置管理员")
-    invalid_tokens = [t for t, info in TOKENS_DB.items() if info.username == username]
-    for t in invalid_tokens: del TOKENS_DB[t]
-    return {"message": f"已强制下线 {username}"}
+        raise HTTPException(status_code=400, detail="不能下线管理员自己")
+    tokens_to_remove = [token for token, user in TOKENS_DB.items() if user == username]
+    for token in tokens_to_remove:
+        del TOKENS_DB[token]
+    return {"message": f"已成功将用户 {username} 强制下线"}
 
 @app.get("/api/admin/online-users")
-async def get_online_users(current_user: UserItem = Depends(get_current_user)):
-    if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="无管理员权限")
-    active_users = list({info.username for info in TOKENS_DB.values()})
-    return {"online_users": active_users}
+async def get_online_users(current_user: dict = Depends(get_current_user)):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="无权限")
+    return {"online_users": list(set(TOKENS_DB.values()))}
 
-# -------------------------- API路由：图片任务管理（线程池优化） --------------------------
+# ----------------- 任务处理路由 -----------------
 @app.post("/api/tasks/create_batch")
-async def create_batch_tasks(
-    files: List[UploadFile] = File(...),
-    junk_size_mb: float = Query(default=DEFAULT_JUNK_SIZE, ge=0.1, le=MAX_JUNK_SIZE),
-    current_user: UserItem = Depends(get_current_user)
-):
+async def create_batch_tasks(files: List[UploadFile] = File(...), junk_size_mb: float = Form(1.0), current_user: dict = Depends(get_current_user)):
     task_ids = []
+    temp_dir = "/tmp/tasks"
+    os.makedirs(temp_dir, exist_ok=True)
+    
     for file in files:
         task_id = str(uuid.uuid4())[:8]
-        safe_name = safe_filename(file.filename)
-        input_path = os.path.join(UPLOAD_TMP_DIR, f"in_{task_id}_{safe_name}")
-        base_name, _ = os.path.splitext(safe_name)
-        output_path = os.path.join(UPLOAD_TMP_DIR, f"{base_name}_{task_id}.file")
-
-        # 写入上传文件
-        with open(input_path, "wb") as buf:
-            buf.write(await file.read())
-
-        TASKS_DB[task_id] = TaskItem(
-            task_id=task_id, username=current_user.username, filename=safe_name,
-            out_name=f"{base_name}.file", status="排队中", stop_requested=False,
-            result_path=None, created_at=time.strftime("%H:%M:%S")
-        )
-        # 提交线程池，替代新建线程
-        task_executor.submit(background_process_image, task_id, input_path, output_path, junk_size_mb)
+        input_path = os.path.join(temp_dir, f"in_{task_id}_{file.filename}")
+        base_name, _ = os.path.splitext(file.filename)
+        output_path = os.path.join(temp_dir, f"{base_name}_{task_id}.file")
+        
+        with open(input_path, "wb") as buffer:
+            buffer.write(await file.read())
+            
+        TASKS_DB[task_id] = {
+            "task_id": task_id, "username": current_user["username"], "filename": file.filename,
+            "out_name": f"{base_name}.file",
+            "status": "排队中", "stop_requested": False, "result_path": None, "created_at": time.strftime("%H:%M:%S")
+        }
+        
+        t = threading.Thread(target=background_process_image, args=(task_id, input_path, output_path, junk_size_mb))
+        t.start()
         task_ids.append(task_id)
-    return {"message": f"提交{len(task_ids)}个处理任务", "task_ids": task_ids}
+        
+    return {"message": f"已成功提交 {len(task_ids)} 个文件处理", "task_ids": task_ids}
 
 @app.get("/api/tasks")
-async def list_tasks(current_user: UserItem = Depends(get_current_user)):
-    all_tasks = list(TASKS_DB.values())
-    if current_user.role == "admin":
-        return all_tasks
-    return [t for t in all_tasks if t.username == current_user.username]
+async def list_tasks(current_user: dict = Depends(get_current_user)):
+    if current_user["role"] == "admin":
+        return list(TASKS_DB.values())
+    return [t for t in TASKS_DB.values() if t["username"] == current_user["username"]]
 
 @app.get("/api/tasks/download_zip")
-async def download_zip(current_user: UserItem = Depends(get_current_user)):
-    user_tasks = [
-        t for t in TASKS_DB.values()
-        if (current_user.role == "admin" or t.username == current_user.username)
-        and t.status == "已完成" and t.result_path and os.path.exists(t.result_path)
-    ]
+async def download_zip(current_user: dict = Depends(get_current_user)):
+    user_tasks = [t for t in TASKS_DB.values() if (current_user["role"] == "admin" or t["username"] == current_user["username"]) and t["status"] == "已完成"]
     if not user_tasks:
-        raise HTTPException(status_code=400, detail="无已完成文件可打包下载")
-    zip_name = f"processed_{int(time.time())}.zip"
-    zip_path = os.path.join(UPLOAD_TMP_DIR, zip_name)
+        raise HTTPException(status_code=400, detail="当前没有已完成的可供下载的文件")
+        
+    zip_filename = f"processed_files_{int(time.time())}.zip"
+    zip_path = os.path.join("/tmp", zip_filename)
+    
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
         for t in user_tasks:
-            zipf.write(t.result_path, arcname=t.out_name)
+            if t["result_path"] and os.path.exists(t["result_path"]):
+                zipf.write(t["result_path"], arcname=t["out_name"])
+                
     return FileResponse(zip_path, filename="批量处理图片包.zip")
 
 @app.post("/api/tasks/clear")
-async def clear_tasks(current_user: UserItem = Depends(get_current_user)):
-    del_ids = []
-    for tid, task in TASKS_DB.items():
-        if current_user.role == "admin" or task.username == current_user.username:
-            if task.result_path and os.path.exists(task.result_path):
-                try: os.remove(task.result_path)
-                except Exception as e: logger.warning(f"删除结果文件失败：{e}")
-            del_ids.append(tid)
-    for tid in del_ids: del TASKS_DB[tid]
-    return {"message": f"清空{len(del_ids)}条任务记录"}
+async def clear_tasks(current_user: dict = Depends(get_current_user)):
+    to_delete = []
+    for task_id, task in TASKS_DB.items():
+        if current_user["role"] == "admin" or task["username"] == current_user["username"]:
+            if task["result_path"] and os.path.exists(task["result_path"]):
+                try: os.remove(task["result_path"])
+                except: pass
+            to_delete.append(task_id)
+            
+    for task_id in to_delete:
+        del TASKS_DB[task_id]
+        
+    return {"message": f"已成功清空 {len(to_delete)} 个任务记录"}
 
 @app.post("/api/tasks/{task_id}/stop")
-async def stop_task(task_id: str, current_user: UserItem = Depends(get_current_user)):
+async def stop_task(task_id: str, current_user: dict = Depends(get_current_user)):
     task = TASKS_DB.get(task_id)
     if not task: raise HTTPException(status_code=404, detail="任务不存在")
-    if current_user.role != "admin" and task.username != current_user.username:
-        raise HTTPException(status_code=403, detail="无权操作")
-    task.stop_requested = True
-    task.status = "正在停止..."
-    return {"message": "停止指令已下发"}
+    if current_user["role"] != "admin" and task["username"] != current_user["username"]:
+        raise HTTPException(status_code=403, detail="无权限")
+    task["stop_requested"] = True
+    task["status"] = "正在停止..."
+    return {"message": "已发送停止信号"}
 
 @app.get("/api/tasks/{task_id}/download")
-async def download_task_file(task_id: str, current_user: UserItem = Depends(get_current_user)):
+async def download_task_file(task_id: str, current_user: dict = Depends(get_current_user)):
     task = TASKS_DB.get(task_id)
-    if not task or task.status != "已完成" or not task.result_path or not os.path.exists(task.result_path):
-        raise HTTPException(status_code=400, detail="文件未就绪或不存在")
-    if current_user.role != "admin" and task.username != current_user.username:
-        raise HTTPException(status_code=403, detail="无权下载")
-    return FileResponse(task.result_path, filename=task.out_name)
+    if not task or task["status"] != "已完成":
+        raise HTTPException(status_code=400, detail="文件尚未就绪")
+    if current_user["role"] != "admin" and task["username"] != current_user["username"]:
+        raise HTTPException(status_code=403, detail="无权限")
+    return FileResponse(task["result_path"], filename=task["out_name"])
 
-# -------------------------- 前端页面（小幅细节优化，逻辑不变） --------------------------
+# ---------------- 4. 前端页面 ----------------
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
     return """
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>在线图片处理系统 - 优化版</title>
-    <style>
-        body { font-family: system-ui, sans-serif; margin: 2rem; background: #f4f4f9; }
-        .card { background: white; padding: 24px; border-radius: 8px; margin: 0 auto 20px; max-width: 950px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
-        .hidden { display: none !important; }
-        input, select { padding: 8px 10px; border: 1px solid #ccc; border-radius: 4px; margin: 0 8px 8px 0; }
-        table { width: 100%; border-collapse: collapse; margin: 15px 0; }
-        th, td { border: 1px solid #eee; padding: 10px; text-align: left; }
-        th { background: #f8f9fa; }
-        .btn { padding: 6px 12px; border: none; border-radius: 4px; cursor: pointer; font-weight: 500; margin-right: 6px; }
-        .btn-primary { background: #0066cc; color: #fff; }
-        .btn-danger { background: #dc3545; color: #fff; }
-        .btn-success { background: #28a745; color: #fff; }
-        .btn-warning { background: #ff9800; color: #fff; }
-        .toolbar { display: flex; justify-content: space-between; align-items: center; margin-top: 1rem; }
-        .form-box { background: #f9f9f9; padding: 16px; border-radius: 6px; margin: 12px 0; border: 1px dashed #ddd; }
-    </style>
-</head>
-<body>
-    <div id="loginCard" class="card">
-        <h2>系统登录</h2>
-        <div>
-            <input type="text" id="loginUsername" placeholder="用户名">
-            <input type="password" id="loginPassword" placeholder="密码">
-            <button class="btn btn-primary" onclick="login()">登录</button>
+    <!DOCTYPE html>
+    <html lang="zh-CN">
+    <head>
+        <meta charset="UTF-8">
+        <title>在线图片处理系统 - 自由管理版</title>
+        <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 30px; background: #f4f4f9; }
+            .card { background: white; padding: 25px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); max-width: 950px; margin-left: auto; margin-right: auto; }
+            .hidden { display: none !important; }
+            input[type="text"], input[type="password"], select { padding: 8px 12px; border: 1px solid #ccc; border-radius: 4px; margin-right: 10px; }
+            table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+            th, td { border: 1px solid #eee; padding: 10px; text-align: left; }
+            th { background-color: #f8f9fa; }
+            .btn { padding: 6px 14px; border: none; border-radius: 4px; cursor: pointer; font-weight: 500; margin-right: 5px; }
+            .btn-primary { background-color: #0066cc; color: white; }
+            .btn-danger { background-color: #dc3545; color: white; }
+            .btn-success { background-color: #28a745; color: white; }
+            .btn-warning { background-color: #ff9800; color: white; }
+            .toolbar { display: flex; justify-content: space-between; align-items: center; margin-top: 15px; }
+            .form-box { background: #f9f9f9; padding: 15px; border-radius: 6px; margin-bottom: 15px; border: 1px dashed #ddd; }
+        </style>
+    </head>
+    <body>
+        <div id="loginCard" class="card">
+            <h2>系统登录</h2>
+            <div style="margin-top: 15px;">
+                <input type="text" id="loginUsername" placeholder="请输入用户名">
+                <input type="password" id="loginPassword" placeholder="请输入密码">
+                <button class="btn btn-primary" onclick="login()">登录</button>
+            </div>
         </div>
-    </div>
-    <div id="mainCard" class="card hidden">
-        <div style="display:flex;justify-content:space-between;align-items:center">
-            <h2>控制台 <span id="userInfo"></span></h2>
-            <button class="btn btn-danger" onclick="logout()">退出登录</button>
-        </div>
-        <hr>
-        <h3>批量上传JPEG图片</h3>
-        <div>
-            <input type="file" id="imageFiles" accept=".jpg,.jpeg" multiple>
-            垃圾数据(MB): <input type="number" id="junkSize" value="1" min="0.1" max="50" step="0.5" style="width:70px">
-            <button class="btn btn-primary" onclick="submitBatchTasks()">开始处理</button>
-        </div>
-        <div class="toolbar">
-            <h3>任务列表</h3>
+
+        <div id="mainCard" class="card hidden">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h2>控制台 - 当前用户: <span id="userInfo"></span></h2>
+                <button class="btn btn-danger" onclick="logout()">退出登录</button>
+            </div>
+            <hr style="border:0; border-top:1px solid #eee; margin: 15px 0;">
+            
+            <h3>批量上传 JPEG 图片</h3>
             <div>
-                <button class="btn btn-success" onclick="downloadZip()">打包下载全部</button>
-                <button class="btn btn-warning" onclick="clearTasks()">清空任务</button>
+                <input type="file" id="imageFiles" accept=".jpg,.jpeg,.jpe,.jfif" multiple>
+                垃圾数据 (MB): <input type="number" id="junkSize" value="1.0" step="0.5" style="width:60px;">
+                <button class="btn btn-primary" onclick="submitBatchTasks()">开始批量处理</button>
+            </div>
+
+            <div class="toolbar" style="margin-top: 25px;">
+                <h3 style="margin: 0;">任务列表</h3>
+                <div>
+                    <button class="btn btn-success" onclick="downloadZip()">📦 打包下载全部已完成 (.zip)</button>
+                    <button class="btn btn-warning" onclick="clearTasks()">🧹 刷新/清除所有记录</button>
+                </div>
+            </div>
+
+            <table>
+                <thead>
+                    <tr><th>任务 ID</th><th>所属用户</th><th>文件名</th><th>状态</th><th>创建时间</th><th>操作</th></tr>
+                </thead>
+                <tbody id="taskTableBody"></tbody>
+            </table>
+
+            <div id="adminPanel" class="hidden" style="margin-top: 30px; border-top: 2px dashed #0066cc; padding-top: 15px;">
+                <h3 style="color: #0066cc;">账号与设备锁管理（管理员专属）</h3>
+                
+                <div class="form-box">
+                    <h4 style="margin-top: 0;">➕ 添加或修改账号密码</h4>
+                    <input type="text" id="newUsername" placeholder="用户名">
+                    <input type="password" id="newPassword" placeholder="设置密码">
+                    <select id="newRole">
+                        <option value="user">普通用户 (受设备限制)</option>
+                        <option value="admin">管理员 (无设备限制)</option>
+                    </select>
+                    <button class="btn btn-primary" onclick="saveUser()">保存账号</button>
+                </div>
+
+                <h4>系统已存账号列表</h4>
+                <table>
+                    <thead>
+                        <tr><th>用户名</th><th>角色</th><th>设备绑定状态</th><th>操作</th></tr>
+                    </thead>
+                    <tbody id="userTableBody"></tbody>
+                </table>
+
+                <h4 style="margin-top: 20px;">当前在线用户</h4>
+                <ul id="onlineUsersList" style="padding-left: 20px;"></ul>
             </div>
         </div>
-        <table><thead><tr><th>任务ID</th><th>用户</th><th>文件名</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead><tbody id="taskTableBody"></tbody></table>
-        <div id="adminPanel" class="hidden" style="margin-top:2rem;padding-top:1rem;border-top:2px dashed #0066cc">
-            <h3 style="color:#0066cc">管理员账号管理</h3>
-            <div class="form-box">
-                <h4>新增/修改账号</h4>
-                <input type="text" id="newUsername" placeholder="用户名">
-                <input type="password" id="newPassword" placeholder="密码">
-                <select id="newRole"><option value="user">普通用户</option><option value="admin">管理员</option></select>
-                <button class="btn btn-primary" onclick="saveUser()">保存</button>
-            </div>
-            <h4>账号列表</h4>
-            <table><thead><tr><th>用户名</th><th>角色</th><th>设备绑定</th><th>操作</th></tr></thead><tbody id="userTableBody"></tbody></table>
-            <h4>在线用户</h4>
-            <ul id="onlineUsersList"></ul>
-        </div>
-    </div>
-<script>
-let currentUser=null,poll=null;
-function getDeviceId(){
-    let d=localStorage.getItem("dev_fp");
-    if(!d){d="DEV-"+Math.random().toString(36).slice(2)+Date.now();localStorage.setItem("dev_fp",d)}
-    return d
-}
-window.onload=()=>{
-    const t=localStorage.getItem("token");
-    if(t){currentUser={token:t,role:localStorage.getItem("role"),username:localStorage.getItem("username")};showMainUI()}
-}
-async function login(){
-    const u=document.getElementById("loginUsername").value,p=document.getElementById("loginPassword").value;
-    if(!u||!p)return alert("补全账号密码");
-    const fd=new URLSearchParams({username:u,password:p,device_id:getDeviceId()});
-    const res=await fetch("/api/login",{method:"POST",body:fd});
-    const data=await res.json();
-    if(!res.ok)return alert("登录失败："+data.detail);
-    currentUser={token:data.access_token,role:data.role,username:data.username};
-    localStorage.setItem("token",data.access_token);
-    localStorage.setItem("role",data.role);
-    localStorage.setItem("username",data.username);
-    showMainUI()
-}
-function logout(){localStorage.clear();currentUser=null;clearInterval(poll);document.getElementById("loginCard").classList.remove("hidden");document.getElementById("mainCard").classList.add("hidden")}
-function showMainUI(){
-    document.getElementById("loginCard").classList.add("hidden");
-    document.getElementById("mainCard").classList.remove("hidden");
-    document.getElementById("userInfo").innerText=`(${currentUser.role==="admin"?"管理员":"普通用户"}) ${currentUser.username}`;
-    if(currentUser.role==="admin"){document.getElementById("adminPanel").classList.remove("hidden");fetchAdminData()}
-    fetchTasks();clearInterval(poll);poll=setInterval(()=>{fetchTasks();currentUser.role==="admin"&&fetchAdminData()},2000)
-}
-async function fetchAdminData(){fetchOnlineUsers();fetchUserList()}
-async function fetchUserList(){
-    const res=await fetch("/api/admin/users",{headers:{Authorization:`Bearer ${currentUser.token}`}});
-    const users=await res.json(),tb=document.getElementById("userTableBody");tb.innerHTML="";
-    users.forEach(u=>{
-        let act=u.is_bound?`<button class='btn btn-warning' style='padding:2px 6px;font-size:12px' onclick='unbindDevice("${u.username}")'>解锁设备</button> `:"";
-        if(u.username!=="admin")act+=`<button class='btn btn-danger' style='padding:2px 6px;font-size:12px' onclick='deleteUser("${u.username}")'>删除</button>`;
-        tb.innerHTML+=`<tr><td>${u.username}</td><td>${u.role==="admin"?"管理员":"普通用户"}</td><td>${u.is_bound?"已绑定":"未绑定"}</td><td>${act}</td></tr>`
-    })
-}
-async function saveUser(){
-    const u=document.getElementById("newUsername").value,p=document.getElementById("newPassword").value,r=document.getElementById("newRole").value;
-    if(!u||!p)return alert("补全账号密码");
-    const fd=new FormData();fd.append("username",u);fd.append("password",p);fd.append("role",r);
-    const res=await fetch("/api/admin/save_user",{method:"POST",headers:{Authorization:`Bearer ${currentUser.token}`},body:fd});
-    alert((await res.json()).message);fetchUserList()
-}
-async function deleteUser(n){if(!confirm(`删除${n}？`))return;const fd=new FormData();fd.append("username",n);await fetch("/api/admin/delete_user",{method:"POST",headers:{Authorization:`Bearer ${currentUser.token}`},body:fd});fetchUserList()}
-async function unbindDevice(n){if(!confirm(`解锁${n}？`))return;const fd=new FormData();fd.append("username",n);await fetch("/api/admin/unbind_device",{method:"POST",headers:{Authorization:`Bearer ${currentUser.token}`},body:fd});fetchUserList()}
-async function kickout(n){if(!confirm(`下线${n}？`))return;const fd=new FormData();fd.append("username",n);await fetch("/api/admin/kickout",{method:"POST",headers:{Authorization:`Bearer ${currentUser.token}`},body:fd});fetchOnlineUsers()}
-async function submitBatchTasks(){
-    const fs=document.getElementById("imageFiles").files;if(!fs.length)return alert("选择图片");
-    const fd=new FormData();[...fs].forEach(f=>fd.append("files",f));fd.append("junk_size_mb",document.getElementById("junkSize").value);
-    const res=await fetch("/api/tasks/create_batch",{method:"POST",headers:{Authorization:`Bearer ${currentUser.token}`},body:fd});
-    res.ok?alert(`提交${fs.length}个任务`):alert("提交失败");fetchTasks()
-}
-async function fetchTasks(){
-    const res=await fetch("/api/tasks",{headers:{Authorization:`Bearer ${currentUser.token}`}});
-    if(res.status===401)return logout();
-    const tasks=await res.json(),tb=document.getElementById("taskTableBody");tb.innerHTML="";
-    tasks.forEach(t=>{
-        const owner=t.username===currentUser.username,adm=currentUser.role==="admin";
-        let btn=(t.status==="排队中"||t.status==="处理中")&&(owner||adm)?`<button class='btn btn-danger' onclick='stopTask("${t.task_id}")'>停止</button> `:"";
-        if(t.status==="已完成")btn+=`<button class='btn btn-success' onclick='downloadFile("${t.task_id}")'>下载</button>`;
-        tb.innerHTML+=`<tr><td>${t.task_id}</td><td>${t.username}</td><td>${t.filename}</td><td>${t.status}</td><td>${t.created_at}</td><td>${btn}</td></tr>`
-    })
-}
-async function downloadZip(){
-    const res=await fetch("/api/tasks/download_zip",{headers:{Authorization:`Bearer ${currentUser.token}`}});
-    if(!res.ok)return alert((await res.json()).detail);
-    const blob=await res.blob(),a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=`批量包${Date.now()}.zip`;a.click()
-}
-async function clearTasks(){if(!confirm("清空任务？"))return;await fetch("/api/tasks/clear",{method:"POST",headers:{Authorization:`Bearer ${currentUser.token}`});fetchTasks()}
-async function fetchOnlineUsers(){
-    const res=await fetch("/api/admin/online-users",{headers:{Authorization:`Bearer ${currentUser.token}`}});
-    const list=document.getElementById("onlineUsersList");list.innerHTML="";
-    (await res.json()).online_users.forEach(u=>u!=="admin"&&(list.innerHTML+=`<li>${u} <button class='btn btn-danger' style='padding:2px 6px;font-size:12px' onclick='kickout("${u}")'>下线</button></li>`))
-}
-async function stopTask(id){await fetch(`/api/tasks/${id}/stop`,{method:"POST",headers:{Authorization:`Bearer ${currentUser.token}`});fetchTasks()}
-async function downloadFile(id){
-    const res=await fetch(`/api/tasks/${id}/download`,{headers:{Authorization:`Bearer ${currentUser.token}`}});
-    const blob=await res.blob(),a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=`${id}.file`;a.click()
-}
-</script>
-</body>
-</html>
+
+        <script>
+            let currentUser = null, pollInterval = null;
+
+            function getDeviceId() {
+                let deviceId = localStorage.getItem("system_device_fingerprint");
+                if (!deviceId) {
+                    deviceId = 'DEV-' + Math.random().toString(36).substring(2, 15) + '-' + new Date().getTime();
+                    localStorage.setItem("system_device_fingerprint", deviceId);
+                }
+                return deviceId;
+            }
+
+            window.onload = () => {
+                const token = localStorage.getItem("token");
+                if (token) {
+                    currentUser = { token, role: localStorage.getItem("role"), username: localStorage.getItem("username") };
+                    showMainUI();
+                }
+            };
+
+            async function login() {
+                const u = document.getElementById("loginUsername").value;
+                const p = document.getElementById("loginPassword").value;
+                if(!u || !p) return alert("请输入用户名和密码");
+
+                const deviceId = getDeviceId();
+                const body = new URLSearchParams({ username: u, password: p, device_id: deviceId });
+
+                const res = await fetch('/api/login', { method: "POST", body });
+                const data = await res.json();
+                
+                if (!res.ok) return alert("登录失败: " + data.detail);
+
+                currentUser = { token: data.access_token, role: data.role, username: data.username };
+                localStorage.setItem("token", data.access_token);
+                localStorage.setItem("role", data.role);
+                localStorage.setItem("username", data.username);
+                showMainUI();
+            }
+
+            function logout() {
+                localStorage.clear(); currentUser = null; clearInterval(pollInterval);
+                document.getElementById("loginCard").classList.remove("hidden");
+                document.getElementById("mainCard").classList.add("hidden");
+                document.getElementById("adminPanel").classList.add("hidden");
+            }
+
+            function showMainUI() {
+                document.getElementById("loginCard").classList.add("hidden");
+                document.getElementById("mainCard").classList.remove("hidden");
+                document.getElementById("userInfo").innerText = `${currentUser.username} (${currentUser.role === 'admin' ? '管理员' : '普通用户'})`;
+                
+                if (currentUser.role === 'admin') {
+                    document.getElementById("adminPanel").classList.remove("hidden");
+                    fetchAdminData();
+                } else {
+                    document.getElementById("adminPanel").classList.add("hidden");
+                }
+
+                fetchTasks();
+                clearInterval(pollInterval);
+                pollInterval = setInterval(() => {
+                    fetchTasks();
+                    if (currentUser && currentUser.role === 'admin') fetchAdminData();
+                }, 2000);
+            }
+
+            async function fetchAdminData() {
+                fetchOnlineUsers();
+                fetchUserList();
+            }
+
+            async function fetchUserList() {
+                if (!currentUser || currentUser.role !== 'admin') return;
+                const res = await fetch('/api/admin/users', { headers: { "Authorization": `Bearer ${currentUser.token}` } });
+                if (!res.ok) return;
+                const users = await res.json();
+                const tbody = document.getElementById("userTableBody");
+                tbody.innerHTML = "";
+                users.forEach(u => {
+                    let actions = "";
+                    if(u.is_bound) {
+                        actions += `<button class="btn btn-warning" style="padding:2px 8px; font-size:12px;" onclick="unbindDevice('${u.username}')">🔓 重置设备锁</button> `;
+                    }
+                    if(u.username !== 'admin') {
+                        actions += `<button class="btn btn-danger" style="padding:2px 8px; font-size:12px;" onclick="deleteUser('${u.username}')">🗑️ 删除账户</button>`;
+                    }
+                    tbody.innerHTML += `<tr>
+                        <td><b>${u.username}</b></td>
+                        <td>${u.role === 'admin' ? '<span style="color:red">管理员</span>' : '普通用户'}</td>
+                        <td>${u.is_bound ? '<span style="color:orange">🔒 已绑定设备</span>' : '<span style="color:green">🔓 未绑定 (可新登)</span>'}</td>
+                        <td>${actions}</td>
+                    </tr>`;
+                });
+            }
+
+            async function saveUser() {
+                const u = document.getElementById("newUsername").value;
+                const p = document.getElementById("newPassword").value;
+                const r = document.getElementById("newRole").value;
+                if(!u || !p) return alert("请填写完整的用户名和密码！");
+
+                const formData = new FormData();
+                formData.append("username", u);
+                formData.append("password", p);
+                formData.append("role", r);
+
+                const res = await fetch('/api/admin/save_user', {
+                    method: "POST",
+                    headers: { "Authorization": `Bearer ${currentUser.token}` },
+                    body: formData
+                });
+                const data = await res.json();
+                alert(data.message);
+                document.getElementById("newUsername").value = "";
+                document.getElementById("newPassword").value = "";
+                fetchUserList();
+            }
+
+            async function deleteUser(username) {
+                if(!confirm(`确定要彻底删除账号 ${username} 吗？`)) return;
+                const formData = new FormData();
+                formData.append("username", username);
+                const res = await fetch('/api/admin/delete_user', {
+                    method: "POST",
+                    headers: { "Authorization": `Bearer ${currentUser.token}` },
+                    body: formData
+                });
+                const data = await res.json();
+                alert(data.message);
+                fetchUserList();
+            }
+
+            async function submitBatchTasks() {
+                const files = document.getElementById("imageFiles").files;
+                if (!files || files.length === 0) return alert("请至少选择一张图片！");
+
+                const formData = new FormData();
+                for(let i = 0; i < files.length; i++) {
+                    formData.append("files", files[i]);
+                }
+                formData.append("junk_size_mb", document.getElementById("junkSize").value);
+
+                const res = await fetch('/api/tasks/create_batch', {
+                    method: "POST",
+                    headers: { "Authorization": `Bearer ${currentUser.token}` },
+                    body: formData
+                });
+                if (res.ok) { 
+                    alert(`成功提交 ${files.length} 张图片！`);
+                    document.getElementById("imageFiles").value = "";
+                    fetchTasks(); 
+                } else { alert("提交失败"); }
+            }
+
+            async function fetchTasks() {
+                if (!currentUser) return;
+                const res = await fetch('/api/tasks', { headers: { "Authorization": `Bearer ${currentUser.token}` } });
+                if (!res.ok) { if(res.status === 401) logout(); return; }
+                const tasks = await res.json();
+                const tbody = document.getElementById("taskTableBody");
+                tbody.innerHTML = "";
+                tasks.forEach(t => {
+                    const isOwner = t.username === currentUser.username, isAdmin = currentUser.role === "admin";
+                    const isRunning = t.status === "排队中" || t.status === "处理中";
+                    let btn = "";
+                    if (isRunning && (isAdmin || isOwner)) {
+                        btn += `<button class="btn btn-danger" onclick="stopTask('${t.task_id}')">停止</button> `;
+                    }
+                    if (t.status === "已完成") {
+                        btn += `<button class="btn btn-success" onclick="downloadFile('${t.task_id}')">单文件下载</button>`;
+                    }
+                    tbody.innerHTML += `<tr><td>${t.task_id}</td><td><b>${t.username}</b></td><td>${t.filename}</td><td>${t.status}</td><td>${t.created_at}</td><td>${btn}</td></tr>`;
+                });
+            }
+
+            async function downloadZip() {
+                const res = await fetch('/api/tasks/download_zip', { headers: { "Authorization": `Bearer ${currentUser.token}` } });
+                if(!res.ok) {
+                    const err = await res.json();
+                    return alert(err.detail || "下载失败");
+                }
+                const blob = await res.blob();
+                const a = document.createElement('a');
+                a.href = window.URL.createObjectURL(blob);
+                a.download = `批量图片包_${new Date().getTime()}.zip`;
+                a.click();
+            }
+
+            async function clearTasks() {
+                if(!confirm("确定要刷新并清除当前列表及服务器上的所有临时文件吗？")) return;
+                const res = await fetch('/api/tasks/clear', {
+                    method: "POST",
+                    headers: { "Authorization": `Bearer ${currentUser.token}` }
+                });
+                if(res.ok) {
+                    alert("已经成功清除！");
+                    fetchTasks();
+                }
+            }
+
+            async function fetchOnlineUsers() {
+                if (!currentUser || currentUser.role !== 'admin') return;
+                const res = await fetch('/api/admin/online-users', { headers: { "Authorization": `Bearer ${currentUser.token}` } });
+                if (!res.ok) return;
+                const data = await res.json();
+                const list = document.getElementById("onlineUsersList");
+                list.innerHTML = "";
+                data.online_users.forEach(user => {
+                    if(user !== 'admin') {
+                        list.innerHTML += `<li style="margin-bottom:8px;">用户：<b>${user}</b> <button class="btn btn-danger" style="padding:2px 8px; font-size:12px;" onclick="kickout('${user}')">强行下线</button></li>`;
+                    }
+                });
+            }
+
+            async function unbindDevice(username) {
+                if(!confirm(`确定要解锁用户 ${username} 的电脑绑定吗？`)) return;
+                const formData = new FormData();
+                formData.append("username", username);
+                const res = await fetch('/api/admin/unbind_device', {
+                    method: "POST",
+                    headers: { "Authorization": `Bearer ${currentUser.token}` },
+                    body: formData
+                });
+                const data = await res.json();
+                alert(data.message);
+                fetchUserList();
+            }
+
+            async function kickout(username) {
+                if(!confirm(`确定要强行踢出用户 ${username} 吗？`)) return;
+                const formData = new FormData();
+                formData.append("username", username);
+                const res = await fetch('/api/admin/kickout', {
+                    method: "POST",
+                    headers: { "Authorization": `Bearer ${currentUser.token}` },
+                    body: formData
+                });
+                const data = await res.json();
+                alert(data.message);
+                fetchOnlineUsers();
+            }
+
+            async function stopTask(id) {
+                await fetch(`/api/tasks/${id}/stop`, { method: "POST", headers: { "Authorization": `Bearer ${currentUser.token}` } });
+                fetchTasks();
+            }
+
+            async function downloadFile(id) {
+                const res = await fetch(`/api/tasks/${id}/download`, { headers: { "Authorization": `Bearer ${currentUser.token}` } });
+                const blob = await res.blob();
+                const a = document.createElement('a');
+                a.href = window.URL.createObjectURL(blob);
+                a.download = `${id}.file`;
+                a.click();
+            }
+        </script>
+    </body>
+    </html>
     """
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
