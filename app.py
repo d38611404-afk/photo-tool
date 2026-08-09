@@ -9,10 +9,10 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from PIL import Image
 
-app = FastAPI(title="在线图片处理器")
+app = FastAPI(title="在线图片处理系统")
 
 # ---------------- 1. 用户与任务数据库 ----------------
-# 说明：账号密码在后台管理，前端页面不再显示
+# 说明：用户名和密码均在此后台字典配置
 USERS_DB = {
     "admin": {"username": "admin", "password": "adminpassword", "role": "admin"},
     "user1": {"username": "user1", "password": "123", "role": "user"},
@@ -148,7 +148,7 @@ async def kickout_user(username: str = Form(...), current_user: dict = Depends(g
 @app.get("/api/admin/online-users")
 async def get_online_users(current_user: dict = Depends(get_current_user)):
     if current_user["role"] != "admin":
-        raise HTTPException(status_code=403, detail="无权限")
+        raise HTTPException(status_code=403, detail="无权限访问此数据")
     return {"online_users": list(set(TOKENS_DB.values()))}
 
 @app.post("/api/tasks/create")
@@ -211,7 +211,7 @@ async def serve_index():
         <style>
             body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 30px; background: #f4f4f9; }
             .card { background: white; padding: 25px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); max-width: 900px; margin-left: auto; margin-right: auto; }
-            .hidden { display: none; }
+            .hidden { display: none !important; }
             input[type="text"], input[type="password"] { padding: 8px 12px; border: 1px solid #ccc; border-radius: 4px; margin-right: 10px; }
             table { width: 100%; border-collapse: collapse; margin-top: 15px; }
             th, td { border: 1px solid #eee; padding: 10px; text-align: left; }
@@ -299,6 +299,7 @@ async def serve_index():
                 clearInterval(pollInterval);
                 document.getElementById("loginCard").classList.remove("hidden");
                 document.getElementById("mainCard").classList.add("hidden");
+                document.getElementById("adminPanel").classList.add("hidden");
             }
 
             function showMainUI() {
@@ -306,16 +307,21 @@ async def serve_index():
                 document.getElementById("mainCard").classList.remove("hidden");
                 document.getElementById("userInfo").innerText = `${currentUser.username} (${currentUser.role === 'admin' ? '管理员' : '普通用户'})`;
                 
-                if(currentUser.role === 'admin') {
+                // 只有角色的确是 admin 时才显示在线管理区域并拉取在线列表
+                if (currentUser.role === 'admin') {
                     document.getElementById("adminPanel").classList.remove("hidden");
+                    fetchOnlineUsers();
+                } else {
+                    document.getElementById("adminPanel").classList.add("hidden");
                 }
 
                 fetchTasks();
-                fetchOnlineUsers();
                 clearInterval(pollInterval);
                 pollInterval = setInterval(() => {
                     fetchTasks();
-                    fetchOnlineUsers();
+                    if (currentUser && currentUser.role === 'admin') {
+                        fetchOnlineUsers();
+                    }
                 }, 2000);
             }
 
@@ -367,12 +373,13 @@ async def serve_index():
                 list.innerHTML = "";
                 data.online_users.forEach(user => {
                     if(user !== 'admin') {
-                        list.innerHTML += `<li style="margin-bottom:8px;">${user} <button class="btn btn-danger" style="padding:2px 8px; font-size:12px;" onclick="kickout('${user}')">强行下线</button></li>`;
+                        list.innerHTML += `<li style="margin-bottom:8px;">用户：<b>${user}</b> <button class="btn btn-danger" style="padding:2px 8px; font-size:12px;" onclick="kickout('${user}')">强行下线</button></li>`;
                     }
                 });
             }
 
             async function kickout(username) {
+                if(!confirm(`确定要强行踢出用户 ${username} 吗？`)) return;
                 const formData = new FormData();
                 formData.append("username", username);
                 const res = await fetch('/api/admin/kickout', {
