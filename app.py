@@ -10,10 +10,9 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from PIL import Image
 
-app = FastAPI(title="在线图片处理系统 - 设备锁死版")
+app = FastAPI(title="在线图片处理系统 - 动态账号与设备锁版")
 
 # ---------------- 1. 用户与任务数据库 ----------------
-# 增加了 bound_device 字段，初始为 None（未绑定）
 USERS_DB = {
     "admin": {"username": "admin", "password": "adminpassword", "role": "admin", "bound_device": None},
     "user1": {"username": "user1", "password": "123", "role": "user", "bound_device": None},
@@ -126,7 +125,7 @@ def background_process_image(task_id: str, input_path: str, output_path: str, ju
 
 # ---------------- 3. API 路由 ----------------
 
-# 登录逻辑：包含设备识别与设备锁死校验
+# 登录逻辑：管理员任意登，普通用户严格校验设备锁
 @app.post("/api/login")
 async def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
@@ -136,33 +135,88 @@ async def login(
     if not user or user["password"] != form_data.password:
         raise HTTPException(status_code=400, detail="用户名或密码错误")
     
-    # 核心：判断设备绑定锁
-    if user["bound_device"] is None:
-        # 首次登录，自动绑定当前电脑指纹
-        user["bound_device"] = device_id
-    elif user["bound_device"] != device_id:
-        # 绑定的指纹与当前电脑不符，拒绝登录
-        raise HTTPException(
-            status_code=403, 
-            detail="【拒绝登录】该账号已锁死绑定在其他电脑上，无法在此电脑使用！"
-        )
+    # 特殊规则：只有非 admin 用户才受设备锁控制
+    if user["role"] != "admin":
+        if user["bound_device"] is None:
+            # 首次登录，自动绑定当前电脑指纹
+            user["bound_device"] = device_id
+        elif user["bound_device"] != device_id:
+            # 绑定的指纹与当前电脑不符，拒绝登录
+            raise HTTPException(
+                status_code=403, 
+                detail="【拒绝登录】该账号已锁死绑定在其他电脑上，无法在此电脑使用！"
+            )
         
     token = str(uuid.uuid4())
     TOKENS_DB[token] = user["username"]
     return {"access_token": token, "token_type": "bearer", "role": user["role"], "username": user["username"]}
 
-# 管理员专属：一键解绑某个用户的设备锁
+# ----------------- 管理员账户增删改路由 -----------------
+@app.get("/api/admin/users")
+async def list_all_users(current_user: dict = Depends(get_current_user)):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="无权限")
+    # 隐藏敏感属性后返回列表
+    result = []
+    for u, data in USERS_DB.items():
+        result.append({
+            "username": data["username"],
+            "role": data["role"],
+            "is_bound": data["bound_device"] is not None
+        })
+    return result
+
+@app.post("/api/admin/save_user")
+async def save_or_update_user(
+    username: str = Form(...),
+    password: str = Form(...),
+    role: str = Form("user"),
+    current_user: dict = Depends(get_current_user)
+):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="无权限操作")
+    
+    if username in USERS_DB:
+        # 修改已存在用户的密码和角色
+        USERS_DB[username]["password"] = password
+        USERS_DB[username]["role"] = role
+        msg = f"账号 {username} 信息更新成功！"
+    else:
+        # 添加新账号
+        USERS_DB[username] = {
+            "username": username,
+            "password": password,
+            "role": role,
+            "bound_device": None
+        }
+        msg = f"账号 {username} 添加成功！"
+        
+    return {"message": msg}
+
+@app.post("/api/admin/delete_user")
+async def delete_user(username: str = Form(...), current_user: dict = Depends(get_current_user)):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="无权限操作")
+    if username == "admin":
+        raise HTTPException(status_code=400, detail="不能删除系统内置管理账号 admin")
+    if username in USERS_DB:
+        del USERS_DB[username]
+        # 同时踢掉该账号在线 Token
+        tokens_to_remove = [token for token, user in TOKENS_DB.items() if user == username]
+        for token in tokens_to_remove:
+            del TOKENS_DB[token]
+        return {"message": f"用户 {username} 已成功删除！"}
+    raise HTTPException(status_code=404, detail="用户不存在")
+
 @app.post("/api/admin/unbind_device")
 async def unbind_device(username: str = Form(...), current_user: dict = Depends(get_current_user)):
     if current_user["role"] != "admin":
         raise HTTPException(status_code=403, detail="无权限操作")
-    
     user = USERS_DB.get(username)
     if not user:
         raise HTTPException(status_code=404, detail="用户不存在")
-        
-    user["bound_device"] = None  # 重置绑定的设备 ID
-    return {"message": f"已成功解锁用户 {username} 的设备绑定！下次登录将绑定新电脑。"}
+    user["bound_device"] = None
+    return {"message": f"已成功解锁用户 {username} 的设备绑定！"}
 
 @app.post("/api/admin/kickout")
 async def kickout_user(username: str = Form(...), current_user: dict = Depends(get_current_user)):
@@ -170,7 +224,6 @@ async def kickout_user(username: str = Form(...), current_user: dict = Depends(g
         raise HTTPException(status_code=403, detail="无权限操作")
     if username == "admin":
         raise HTTPException(status_code=400, detail="不能下线管理员自己")
-    
     tokens_to_remove = [token for token, user in TOKENS_DB.items() if user == username]
     for token in tokens_to_remove:
         del TOKENS_DB[token]
@@ -182,6 +235,7 @@ async def get_online_users(current_user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="无权限")
     return {"online_users": list(set(TOKENS_DB.values()))}
 
+# ----------------- 任务处理路由 -----------------
 @app.post("/api/tasks/create_batch")
 async def create_batch_tasks(files: List[UploadFile] = File(...), junk_size_mb: float = Form(1.0), current_user: dict = Depends(get_current_user)):
     task_ids = []
@@ -273,12 +327,12 @@ async def serve_index():
     <html lang="zh-CN">
     <head>
         <meta charset="UTF-8">
-        <title>在线图片处理系统 - 设备锁死版</title>
+        <title>在线图片处理系统 - 自由管理版</title>
         <style>
             body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 30px; background: #f4f4f9; }
             .card { background: white; padding: 25px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); max-width: 950px; margin-left: auto; margin-right: auto; }
             .hidden { display: none !important; }
-            input[type="text"], input[type="password"] { padding: 8px 12px; border: 1px solid #ccc; border-radius: 4px; margin-right: 10px; }
+            input[type="text"], input[type="password"], select { padding: 8px 12px; border: 1px solid #ccc; border-radius: 4px; margin-right: 10px; }
             table { width: 100%; border-collapse: collapse; margin-top: 15px; }
             th, td { border: 1px solid #eee; padding: 10px; text-align: left; }
             th { background-color: #f8f9fa; }
@@ -288,6 +342,7 @@ async def serve_index():
             .btn-success { background-color: #28a745; color: white; }
             .btn-warning { background-color: #ff9800; color: white; }
             .toolbar { display: flex; justify-content: space-between; align-items: center; margin-top: 15px; }
+            .form-box { background: #f9f9f9; padding: 15px; border-radius: 6px; margin-bottom: 15px; border: 1px dashed #ddd; }
         </style>
     </head>
     <body>
@@ -329,8 +384,29 @@ async def serve_index():
                 <tbody id="taskTableBody"></tbody>
             </table>
 
-            <div id="adminPanel" class="hidden" style="margin-top: 30px; border-top: 2px dashed #eee; padding-top: 15px;">
-                <h3>在线用户及设备锁管理（管理员专属）</h3>
+            <div id="adminPanel" class="hidden" style="margin-top: 30px; border-top: 2px dashed #0066cc; padding-top: 15px;">
+                <h3 style="color: #0066cc;">账号与设备锁管理（管理员专属）</h3>
+                
+                <div class="form-box">
+                    <h4 style="margin-top: 0;">➕ 添加或修改账号密码</h4>
+                    <input type="text" id="newUsername" placeholder="用户名">
+                    <input type="password" id="newPassword" placeholder="设置密码">
+                    <select id="newRole">
+                        <option value="user">普通用户 (受设备限制)</option>
+                        <option value="admin">管理员 (无设备限制)</option>
+                    </select>
+                    <button class="btn btn-primary" onclick="saveUser()">保存账号</button>
+                </div>
+
+                <h4>系统已存账号列表</h4>
+                <table>
+                    <thead>
+                        <tr><th>用户名</th><th>角色</th><th>设备绑定状态</th><th>操作</th></tr>
+                    </thead>
+                    <tbody id="userTableBody"></tbody>
+                </table>
+
+                <h4 style="margin-top: 20px;">当前在线用户</h4>
                 <ul id="onlineUsersList" style="padding-left: 20px;"></ul>
             </div>
         </div>
@@ -338,7 +414,6 @@ async def serve_index():
         <script>
             let currentUser = null, pollInterval = null;
 
-            // 生成/获取当前电脑的唯一硬件设备指纹
             function getDeviceId() {
                 let deviceId = localStorage.getItem("system_device_fingerprint");
                 if (!deviceId) {
@@ -362,11 +437,7 @@ async def serve_index():
                 if(!u || !p) return alert("请输入用户名和密码");
 
                 const deviceId = getDeviceId();
-                const body = new URLSearchParams({ 
-                    username: u, 
-                    password: p,
-                    device_id: deviceId 
-                });
+                const body = new URLSearchParams({ username: u, password: p, device_id: deviceId });
 
                 const res = await fetch('/api/login', { method: "POST", body });
                 const data = await res.json();
@@ -394,7 +465,7 @@ async def serve_index():
                 
                 if (currentUser.role === 'admin') {
                     document.getElementById("adminPanel").classList.remove("hidden");
-                    fetchOnlineUsers();
+                    fetchAdminData();
                 } else {
                     document.getElementById("adminPanel").classList.add("hidden");
                 }
@@ -403,8 +474,74 @@ async def serve_index():
                 clearInterval(pollInterval);
                 pollInterval = setInterval(() => {
                     fetchTasks();
-                    if (currentUser && currentUser.role === 'admin') fetchOnlineUsers();
+                    if (currentUser && currentUser.role === 'admin') fetchAdminData();
                 }, 2000);
+            }
+
+            async function fetchAdminData() {
+                fetchOnlineUsers();
+                fetchUserList();
+            }
+
+            async function fetchUserList() {
+                if (!currentUser || currentUser.role !== 'admin') return;
+                const res = await fetch('/api/admin/users', { headers: { "Authorization": `Bearer ${currentUser.token}` } });
+                if (!res.ok) return;
+                const users = await res.json();
+                const tbody = document.getElementById("userTableBody");
+                tbody.innerHTML = "";
+                users.forEach(u => {
+                    let actions = "";
+                    if(u.is_bound) {
+                        actions += `<button class="btn btn-warning" style="padding:2px 8px; font-size:12px;" onclick="unbindDevice('${u.username}')">🔓 重置设备锁</button> `;
+                    }
+                    if(u.username !== 'admin') {
+                        actions += `<button class="btn btn-danger" style="padding:2px 8px; font-size:12px;" onclick="deleteUser('${u.username}')">🗑️ 删除账户</button>`;
+                    }
+                    tbody.innerHTML += `<tr>
+                        <td><b>${u.username}</b></td>
+                        <td>${u.role === 'admin' ? '<span style="color:red">管理员</span>' : '普通用户'}</td>
+                        <td>${u.is_bound ? '<span style="color:orange">🔒 已绑定设备</span>' : '<span style="color:green">🔓 未绑定 (可新登)</span>'}</td>
+                        <td>${actions}</td>
+                    </tr>`;
+                });
+            }
+
+            async function saveUser() {
+                const u = document.getElementById("newUsername").value;
+                const p = document.getElementById("newPassword").value;
+                const r = document.getElementById("newRole").value;
+                if(!u || !p) return alert("请填写完整的用户名和密码！");
+
+                const formData = new FormData();
+                formData.append("username", u);
+                formData.append("password", p);
+                formData.append("role", r);
+
+                const res = await fetch('/api/admin/save_user', {
+                    method: "POST",
+                    headers: { "Authorization": `Bearer ${currentUser.token}` },
+                    body: formData
+                });
+                const data = await res.json();
+                alert(data.message);
+                document.getElementById("newUsername").value = "";
+                document.getElementById("newPassword").value = "";
+                fetchUserList();
+            }
+
+            async function deleteUser(username) {
+                if(!confirm(`确定要彻底删除账号 ${username} 吗？`)) return;
+                const formData = new FormData();
+                formData.append("username", username);
+                const res = await fetch('/api/admin/delete_user', {
+                    method: "POST",
+                    headers: { "Authorization": `Bearer ${currentUser.token}` },
+                    body: formData
+                });
+                const data = await res.json();
+                alert(data.message);
+                fetchUserList();
             }
 
             async function submitBatchTasks() {
@@ -484,17 +621,13 @@ async def serve_index():
                 list.innerHTML = "";
                 data.online_users.forEach(user => {
                     if(user !== 'admin') {
-                        list.innerHTML += `<li style="margin-bottom:8px;">
-                            用户：<b>${user}</b> 
-                            <button class="btn btn-danger" style="padding:2px 8px; font-size:12px;" onclick="kickout('${user}')">强行下线</button>
-                            <button class="btn btn-warning" style="padding:2px 8px; font-size:12px;" onclick="unbindDevice('${user}')">🔓 重置/解锁设备绑定</button>
-                        </li>`;
+                        list.innerHTML += `<li style="margin-bottom:8px;">用户：<b>${user}</b> <button class="btn btn-danger" style="padding:2px 8px; font-size:12px;" onclick="kickout('${user}')">强行下线</button></li>`;
                     }
                 });
             }
 
             async function unbindDevice(username) {
-                if(!confirm(`确定要解锁用户 ${username} 的电脑绑定吗？解锁后，该用户下次在新的电脑登录时将重新绑定新电脑。`)) return;
+                if(!confirm(`确定要解锁用户 ${username} 的电脑绑定吗？`)) return;
                 const formData = new FormData();
                 formData.append("username", username);
                 const res = await fetch('/api/admin/unbind_device', {
@@ -504,6 +637,7 @@ async def serve_index():
                 });
                 const data = await res.json();
                 alert(data.message);
+                fetchUserList();
             }
 
             async function kickout(username) {
