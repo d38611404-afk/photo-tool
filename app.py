@@ -1,16 +1,16 @@
 import os
-import random
 import time
 import uuid
 import threading
 import zipfile
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List
 from fastapi import FastAPI, File, UploadFile, Form, Depends, HTTPException, status
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from PIL import Image
 
-app = FastAPI(title="在线图片处理系统 - 动态账号与设备锁版")
+app = FastAPI(title="在线图片处理系统 - 终极优化版")
 
 # ---------------- 1. 用户与任务数据库 ----------------
 USERS_DB = {
@@ -101,14 +101,14 @@ def background_process_image(task_id: str, input_path: str, output_path: str, ju
         chunk_size = 1024 * 512
         added = 0
         
+        # 【性能极速优化】使用系统级 os.urandom 瞬间生成垃圾数据
         while added < junk_size_bytes:
             if task["stop_requested"]:
                 task["status"] = "已取消"
                 return
             to_add = min(chunk_size, junk_size_bytes - added)
-            modified_data += bytearray(random.getrandbits(8) for _ in range(to_add))
+            modified_data += os.urandom(to_add)
             added += to_add
-            time.sleep(0.01)
             
         with open(output_path, "wb") as f:
             f.write(modified_data)
@@ -135,13 +135,10 @@ async def login(
     if not user or user["password"] != form_data.password:
         raise HTTPException(status_code=400, detail="用户名或密码错误")
     
-    # 特殊规则：只有非 admin 用户才受设备锁控制
     if user["role"] != "admin":
         if user["bound_device"] is None:
-            # 首次登录，自动绑定当前电脑指纹
             user["bound_device"] = device_id
         elif user["bound_device"] != device_id:
-            # 绑定的指纹与当前电脑不符，拒绝登录
             raise HTTPException(
                 status_code=403, 
                 detail="【拒绝登录】该账号已锁死绑定在其他电脑上，无法在此电脑使用！"
@@ -156,7 +153,6 @@ async def login(
 async def list_all_users(current_user: dict = Depends(get_current_user)):
     if current_user["role"] != "admin":
         raise HTTPException(status_code=403, detail="无权限")
-    # 隐藏敏感属性后返回列表
     result = []
     for u, data in USERS_DB.items():
         result.append({
@@ -177,17 +173,12 @@ async def save_or_update_user(
         raise HTTPException(status_code=403, detail="无权限操作")
     
     if username in USERS_DB:
-        # 修改已存在用户的密码和角色
         USERS_DB[username]["password"] = password
         USERS_DB[username]["role"] = role
         msg = f"账号 {username} 信息更新成功！"
     else:
-        # 添加新账号
         USERS_DB[username] = {
-            "username": username,
-            "password": password,
-            "role": role,
-            "bound_device": None
+            "username": username, "password": password, "role": role, "bound_device": None
         }
         msg = f"账号 {username} 添加成功！"
         
@@ -201,7 +192,6 @@ async def delete_user(username: str = Form(...), current_user: dict = Depends(ge
         raise HTTPException(status_code=400, detail="不能删除系统内置管理账号 admin")
     if username in USERS_DB:
         del USERS_DB[username]
-        # 同时踢掉该账号在线 Token
         tokens_to_remove = [token for token, user in TOKENS_DB.items() if user == username]
         for token in tokens_to_remove:
             del TOKENS_DB[token]
@@ -242,6 +232,9 @@ async def create_batch_tasks(files: List[UploadFile] = File(...), junk_size_mb: 
     temp_dir = "/tmp/tasks"
     os.makedirs(temp_dir, exist_ok=True)
     
+    # 定义东八区（北京时间）
+    beijing_tz = timezone(timedelta(hours=8))
+    
     for file in files:
         task_id = str(uuid.uuid4())[:8]
         input_path = os.path.join(temp_dir, f"in_{task_id}_{file.filename}")
@@ -254,7 +247,8 @@ async def create_batch_tasks(files: List[UploadFile] = File(...), junk_size_mb: 
         TASKS_DB[task_id] = {
             "task_id": task_id, "username": current_user["username"], "filename": file.filename,
             "out_name": f"{base_name}.file",
-            "status": "排队中", "stop_requested": False, "result_path": None, "created_at": time.strftime("%H:%M:%S")
+            "status": "排队中", "stop_requested": False, "result_path": None, 
+            "created_at": datetime.now(beijing_tz).strftime("%H:%M:%S")  # 使用修正后的北京时间
         }
         
         t = threading.Thread(target=background_process_image, args=(task_id, input_path, output_path, junk_size_mb))
@@ -327,7 +321,7 @@ async def serve_index():
     <html lang="zh-CN">
     <head>
         <meta charset="UTF-8">
-        <title>在线图片处理系统 - 自由管理版</title>
+        <title>在线图片处理系统 - 终极优化版</title>
         <style>
             body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 30px; background: #f4f4f9; }
             .card { background: white; padding: 25px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); max-width: 950px; margin-left: auto; margin-right: auto; }
@@ -341,6 +335,7 @@ async def serve_index():
             .btn-danger { background-color: #dc3545; color: white; }
             .btn-success { background-color: #28a745; color: white; }
             .btn-warning { background-color: #ff9800; color: white; }
+            .btn:disabled { background-color: #cccccc; cursor: not-allowed; }
             .toolbar { display: flex; justify-content: space-between; align-items: center; margin-top: 15px; }
             .form-box { background: #f9f9f9; padding: 15px; border-radius: 6px; margin-bottom: 15px; border: 1px dashed #ddd; }
         </style>
@@ -366,11 +361,11 @@ async def serve_index():
             <div>
                 <input type="file" id="imageFiles" accept=".jpg,.jpeg,.jpe,.jfif" multiple>
                 垃圾数据 (MB): <input type="number" id="junkSize" value="1.0" step="0.5" style="width:60px;">
-                <button class="btn btn-primary" onclick="submitBatchTasks()">开始批量处理</button>
+                <button id="submitBtn" class="btn btn-primary" onclick="submitBatchTasks()">开始批量处理</button>
             </div>
 
             <div class="toolbar" style="margin-top: 25px;">
-                <h3 style="margin: 0;">任务列表</h3>
+                <h3 style="margin: 0;">任务列表 (处理完成自动下载)</h3>
                 <div>
                     <button class="btn btn-success" onclick="downloadZip()">📦 打包下载全部已完成 (.zip)</button>
                     <button class="btn btn-warning" onclick="clearTasks()">🧹 刷新/清除所有记录</button>
@@ -386,7 +381,6 @@ async def serve_index():
 
             <div id="adminPanel" class="hidden" style="margin-top: 30px; border-top: 2px dashed #0066cc; padding-top: 15px;">
                 <h3 style="color: #0066cc;">账号与设备锁管理（管理员专属）</h3>
-                
                 <div class="form-box">
                     <h4 style="margin-top: 0;">➕ 添加或修改账号密码</h4>
                     <input type="text" id="newUsername" placeholder="用户名">
@@ -397,7 +391,6 @@ async def serve_index():
                     </select>
                     <button class="btn btn-primary" onclick="saveUser()">保存账号</button>
                 </div>
-
                 <h4>系统已存账号列表</h4>
                 <table>
                     <thead>
@@ -405,7 +398,6 @@ async def serve_index():
                     </thead>
                     <tbody id="userTableBody"></tbody>
                 </table>
-
                 <h4 style="margin-top: 20px;">当前在线用户</h4>
                 <ul id="onlineUsersList" style="padding-left: 20px;"></ul>
             </div>
@@ -413,6 +405,7 @@ async def serve_index():
 
         <script>
             let currentUser = null, pollInterval = null;
+            let autoDownloadedTasks = new Set(); // 记录已自动下载过的任务
 
             function getDeviceId() {
                 let deviceId = localStorage.getItem("system_device_fingerprint");
@@ -518,11 +511,7 @@ async def serve_index():
                 formData.append("password", p);
                 formData.append("role", r);
 
-                const res = await fetch('/api/admin/save_user', {
-                    method: "POST",
-                    headers: { "Authorization": `Bearer ${currentUser.token}` },
-                    body: formData
-                });
+                const res = await fetch('/api/admin/save_user', { method: "POST", headers: { "Authorization": `Bearer ${currentUser.token}` }, body: formData });
                 const data = await res.json();
                 alert(data.message);
                 document.getElementById("newUsername").value = "";
@@ -534,82 +523,10 @@ async def serve_index():
                 if(!confirm(`确定要彻底删除账号 ${username} 吗？`)) return;
                 const formData = new FormData();
                 formData.append("username", username);
-                const res = await fetch('/api/admin/delete_user', {
-                    method: "POST",
-                    headers: { "Authorization": `Bearer ${currentUser.token}` },
-                    body: formData
-                });
+                const res = await fetch('/api/admin/delete_user', { method: "POST", headers: { "Authorization": `Bearer ${currentUser.token}` }, body: formData });
                 const data = await res.json();
                 alert(data.message);
                 fetchUserList();
-            }
-
-            async function submitBatchTasks() {
-                const files = document.getElementById("imageFiles").files;
-                if (!files || files.length === 0) return alert("请至少选择一张图片！");
-
-                const formData = new FormData();
-                for(let i = 0; i < files.length; i++) {
-                    formData.append("files", files[i]);
-                }
-                formData.append("junk_size_mb", document.getElementById("junkSize").value);
-
-                const res = await fetch('/api/tasks/create_batch', {
-                    method: "POST",
-                    headers: { "Authorization": `Bearer ${currentUser.token}` },
-                    body: formData
-                });
-                if (res.ok) { 
-                    alert(`成功提交 ${files.length} 张图片！`);
-                    document.getElementById("imageFiles").value = "";
-                    fetchTasks(); 
-                } else { alert("提交失败"); }
-            }
-
-            async function fetchTasks() {
-                if (!currentUser) return;
-                const res = await fetch('/api/tasks', { headers: { "Authorization": `Bearer ${currentUser.token}` } });
-                if (!res.ok) { if(res.status === 401) logout(); return; }
-                const tasks = await res.json();
-                const tbody = document.getElementById("taskTableBody");
-                tbody.innerHTML = "";
-                tasks.forEach(t => {
-                    const isOwner = t.username === currentUser.username, isAdmin = currentUser.role === "admin";
-                    const isRunning = t.status === "排队中" || t.status === "处理中";
-                    let btn = "";
-                    if (isRunning && (isAdmin || isOwner)) {
-                        btn += `<button class="btn btn-danger" onclick="stopTask('${t.task_id}')">停止</button> `;
-                    }
-                    if (t.status === "已完成") {
-                        btn += `<button class="btn btn-success" onclick="downloadFile('${t.task_id}')">单文件下载</button>`;
-                    }
-                    tbody.innerHTML += `<tr><td>${t.task_id}</td><td><b>${t.username}</b></td><td>${t.filename}</td><td>${t.status}</td><td>${t.created_at}</td><td>${btn}</td></tr>`;
-                });
-            }
-
-            async function downloadZip() {
-                const res = await fetch('/api/tasks/download_zip', { headers: { "Authorization": `Bearer ${currentUser.token}` } });
-                if(!res.ok) {
-                    const err = await res.json();
-                    return alert(err.detail || "下载失败");
-                }
-                const blob = await res.blob();
-                const a = document.createElement('a');
-                a.href = window.URL.createObjectURL(blob);
-                a.download = `批量图片包_${new Date().getTime()}.zip`;
-                a.click();
-            }
-
-            async function clearTasks() {
-                if(!confirm("确定要刷新并清除当前列表及服务器上的所有临时文件吗？")) return;
-                const res = await fetch('/api/tasks/clear', {
-                    method: "POST",
-                    headers: { "Authorization": `Bearer ${currentUser.token}` }
-                });
-                if(res.ok) {
-                    alert("已经成功清除！");
-                    fetchTasks();
-                }
             }
 
             async function fetchOnlineUsers() {
@@ -630,11 +547,7 @@ async def serve_index():
                 if(!confirm(`确定要解锁用户 ${username} 的电脑绑定吗？`)) return;
                 const formData = new FormData();
                 formData.append("username", username);
-                const res = await fetch('/api/admin/unbind_device', {
-                    method: "POST",
-                    headers: { "Authorization": `Bearer ${currentUser.token}` },
-                    body: formData
-                });
+                const res = await fetch('/api/admin/unbind_device', { method: "POST", headers: { "Authorization": `Bearer ${currentUser.token}` }, body: formData });
                 const data = await res.json();
                 alert(data.message);
                 fetchUserList();
@@ -644,14 +557,69 @@ async def serve_index():
                 if(!confirm(`确定要强行踢出用户 ${username} 吗？`)) return;
                 const formData = new FormData();
                 formData.append("username", username);
-                const res = await fetch('/api/admin/kickout', {
-                    method: "POST",
-                    headers: { "Authorization": `Bearer ${currentUser.token}` },
-                    body: formData
-                });
+                const res = await fetch('/api/admin/kickout', { method: "POST", headers: { "Authorization": `Bearer ${currentUser.token}` }, body: formData });
                 const data = await res.json();
                 alert(data.message);
                 fetchOnlineUsers();
+            }
+
+            // ---------------- 批量提交优化（状态提示防多次点击） ----------------
+            async function submitBatchTasks() {
+                const files = document.getElementById("imageFiles").files;
+                if (!files || files.length === 0) return alert("请至少选择一张图片！");
+
+                const btn = document.getElementById("submitBtn");
+                btn.innerText = "⏳ 批量上传与处理中...";
+                btn.disabled = true;
+
+                const formData = new FormData();
+                for(let i = 0; i < files.length; i++) formData.append("files", files[i]);
+                formData.append("junk_size_mb", document.getElementById("junkSize").value);
+
+                try {
+                    const res = await fetch('/api/tasks/create_batch', {
+                        method: "POST", headers: { "Authorization": `Bearer ${currentUser.token}` }, body: formData
+                    });
+                    if (res.ok) { 
+                        document.getElementById("imageFiles").value = "";
+                        fetchTasks(); 
+                    } else { alert("提交失败"); }
+                } catch(e) {
+                    alert("网络异常，提交失败");
+                } finally {
+                    btn.innerText = "开始批量处理";
+                    btn.disabled = false;
+                }
+            }
+
+            // ---------------- 获取任务优化（完成自动下载） ----------------
+            async function fetchTasks() {
+                if (!currentUser) return;
+                const res = await fetch('/api/tasks', { headers: { "Authorization": `Bearer ${currentUser.token}` } });
+                if (!res.ok) { if(res.status === 401) logout(); return; }
+                const tasks = await res.json();
+                const tbody = document.getElementById("taskTableBody");
+                tbody.innerHTML = "";
+                
+                tasks.forEach(t => {
+                    const isOwner = t.username === currentUser.username, isAdmin = currentUser.role === "admin";
+                    const isRunning = t.status === "排队中" || t.status === "处理中";
+                    let btn = "";
+                    
+                    if (isRunning && (isAdmin || isOwner)) {
+                        btn += `<button class="btn btn-danger" onclick="stopTask('${t.task_id}')">停止</button> `;
+                    }
+                    if (t.status === "已完成") {
+                        btn += `<button class="btn btn-success" onclick="downloadFile('${t.task_id}')">单文件下载</button>`;
+                        
+                        // 核心：已完成且属于自己的任务，触发自动下载（仅下一次）
+                        if (isOwner && !autoDownloadedTasks.has(t.task_id)) {
+                            autoDownloadedTasks.add(t.task_id);
+                            downloadFile(t.task_id);
+                        }
+                    }
+                    tbody.innerHTML += `<tr><td>${t.task_id}</td><td><b>${t.username}</b></td><td>${t.filename}</td><td>${t.status}</td><td>${t.created_at}</td><td>${btn}</td></tr>`;
+                });
             }
 
             async function stopTask(id) {
@@ -659,16 +627,66 @@ async def serve_index():
                 fetchTasks();
             }
 
+            // ---------------- 刷新清理优化（同步重置记忆集合） ----------------
+            async function clearTasks() {
+                if(!confirm("确定要刷新并清除当前列表及服务器上的所有临时文件吗？")) return;
+                const res = await fetch('/api/tasks/clear', { method: "POST", headers: { "Authorization": `Bearer ${currentUser.token}` } });
+                if(res.ok) {
+                    autoDownloadedTasks.clear(); // 清空下载记忆，为下一批铺垫
+                    fetchTasks();
+                }
+            }
+
+            // ---------------- 下载拦截与防无响应优化（单文件） ----------------
             async function downloadFile(id) {
-                const res = await fetch(`/api/tasks/${id}/download`, { headers: { "Authorization": `Bearer ${currentUser.token}` } });
-                const blob = await res.blob();
-                const a = document.createElement('a');
-                a.href = window.URL.createObjectURL(blob);
-                a.download = `${id}.file`;
-                a.click();
+                try {
+                    const res = await fetch(`/api/tasks/${id}/download`, { headers: { "Authorization": `Bearer ${currentUser.token}` } });
+                    if (!res.ok) {
+                        const errData = await res.json().catch(() => ({}));
+                        return alert("下载失败: " + (errData.detail || "服务器未找到文件或权限不足，请刷新页面重试"));
+                    }
+                    const blob = await res.blob();
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.style.display = 'none';
+                    a.href = url;
+                    a.download = `${id}.file`;
+                    document.body.appendChild(a);
+                    a.click();
+                    setTimeout(() => {
+                        document.body.removeChild(a);
+                        window.URL.revokeObjectURL(url);
+                    }, 1000);
+                } catch (e) {
+                    alert("网络异常或下载被浏览器拦截，请尝试使用 Chrome 浏览器！");
+                }
+            }
+
+            // ---------------- 下载拦截与防无响应优化（ZIP打包） ----------------
+            async function downloadZip() {
+                try {
+                    const res = await fetch('/api/tasks/download_zip', { headers: { "Authorization": `Bearer ${currentUser.token}` } });
+                    if (!res.ok) {
+                        const errData = await res.json().catch(() => ({}));
+                        return alert("打包失败: " + (errData.detail || "没有已完成的任务可供下载"));
+                    }
+                    const blob = await res.blob();
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.style.display = 'none';
+                    a.href = url;
+                    a.download = `批量图片包_${new Date().getTime()}.zip`;
+                    document.body.appendChild(a);
+                    a.click();
+                    setTimeout(() => {
+                        document.body.removeChild(a);
+                        window.URL.revokeObjectURL(url);
+                    }, 1000);
+                } catch (e) {
+                    alert("网络异常或打包下载失败，请重试！");
+                }
             }
         </script>
     </body>
     </html>
     """
-
