@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from PIL import Image
 
-app = FastAPI(title="在线图片处理系统 - 终极优化版")
+app = FastAPI(title="在线图片处理系统 - 极速直链下载版")
 
 # ---------------- 1. 用户与任务数据库 ----------------
 USERS_DB = {
@@ -101,6 +101,7 @@ def background_process_image(task_id: str, input_path: str, output_path: str, ju
         chunk_size = 1024 * 512
         added = 0
         
+        # 使用 os.urandom 极速添加字节
         while added < junk_size_bytes:
             if task["stop_requested"]:
                 task["status"] = "已取消"
@@ -123,6 +124,7 @@ def background_process_image(task_id: str, input_path: str, output_path: str, ju
             os.remove(temp_img_path)
 
 # ---------------- 3. API 路由 ----------------
+
 @app.post("/api/login")
 async def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
@@ -145,6 +147,7 @@ async def login(
     TOKENS_DB[token] = user["username"]
     return {"access_token": token, "token_type": "bearer", "role": user["role"], "username": user["username"]}
 
+# 管理员路由
 @app.get("/api/admin/users")
 async def list_all_users(current_user: dict = Depends(get_current_user)):
     if current_user["role"] != "admin":
@@ -221,6 +224,7 @@ async def get_online_users(current_user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="无权限")
     return {"online_users": list(set(TOKENS_DB.values()))}
 
+# 任务处理路由
 @app.post("/api/tasks/create_batch")
 async def create_batch_tasks(files: List[UploadFile] = File(...), junk_size_mb: float = Form(1.0), current_user: dict = Depends(get_current_user)):
     task_ids = []
@@ -257,8 +261,13 @@ async def list_tasks(current_user: dict = Depends(get_current_user)):
         return list(TASKS_DB.values())
     return [t for t in TASKS_DB.values() if t["username"] == current_user["username"]]
 
+# 【修改为支持 Query 参数传参的打包下载】
 @app.get("/api/tasks/download_zip")
-async def download_zip(current_user: dict = Depends(get_current_user)):
+async def download_zip(token: str = None):
+    if not token or token not in TOKENS_DB:
+        raise HTTPException(status_code=401, detail="身份认证已过期，请重新登录")
+    current_user = USERS_DB[TOKENS_DB[token]]
+
     user_tasks = [t for t in TASKS_DB.values() if (current_user["role"] == "admin" or t["username"] == current_user["username"]) and t["status"] == "已完成"]
     if not user_tasks:
         raise HTTPException(status_code=400, detail="当前没有已完成的可供下载的文件")
@@ -298,8 +307,13 @@ async def stop_task(task_id: str, current_user: dict = Depends(get_current_user)
     task["status"] = "正在停止..."
     return {"message": "已发送停止信号"}
 
+# 【修改为支持 Query 参数传参的单文件下载】
 @app.get("/api/tasks/{task_id}/download")
-async def download_task_file(task_id: str, current_user: dict = Depends(get_current_user)):
+async def download_task_file(task_id: str, token: str = None):
+    if not token or token not in TOKENS_DB:
+        raise HTTPException(status_code=401, detail="身份认证已过期，请重新登录")
+    current_user = USERS_DB[TOKENS_DB[token]]
+
     task = TASKS_DB.get(task_id)
     if not task or task["status"] != "已完成":
         raise HTTPException(status_code=400, detail="文件尚未就绪")
@@ -307,7 +321,7 @@ async def download_task_file(task_id: str, current_user: dict = Depends(get_curr
         raise HTTPException(status_code=403, detail="无权限")
     return FileResponse(task["result_path"], filename=task["out_name"])
 
-# ---------------- 4. 前端页面（核心改动区） ----------------
+# ---------------- 4. 前端页面 ----------------
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
     return """
@@ -315,7 +329,7 @@ async def serve_index():
     <html lang="zh-CN">
     <head>
         <meta charset="UTF-8">
-        <title>在线图片处理系统 - 终极优化版</title>
+        <title>在线图片处理系统 - 直链下载版</title>
         <style>
             body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 30px; background: #f4f4f9; }
             .card { background: white; padding: 25px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); max-width: 950px; margin-left: auto; margin-right: auto; }
@@ -359,7 +373,7 @@ async def serve_index():
             </div>
 
             <div class="toolbar" style="margin-top: 25px;">
-                <h3 style="margin: 0;">任务列表（处理完成统一打包下载）</h3>
+                <h3 style="margin: 0;">任务列表 (处理完成自动下载)</h3>
                 <div>
                     <button class="btn btn-success" onclick="downloadZip()">📦 打包下载全部已完成 (.zip)</button>
                     <button class="btn btn-warning" onclick="clearTasks()">🧹 刷新/清除所有记录</button>
@@ -399,7 +413,7 @@ async def serve_index():
 
         <script>
             let currentUser = null, pollInterval = null;
-            let allTaskDonePrev = false; // 标记上一轮是否全部任务完成，用于触发自动打包
+            let autoDownloadedTasks = new Set();
 
             function getDeviceId() {
                 let deviceId = localStorage.getItem("system_device_fingerprint");
@@ -592,17 +606,6 @@ async def serve_index():
                 const tasks = await res.json();
                 const tbody = document.getElementById("taskTableBody");
                 tbody.innerHTML = "";
-
-                // 判断当前用户所有任务是否全部完成，触发自动打包
-                const userTasks = tasks.filter(t => t.username === currentUser.username);
-                const hasRunning = userTasks.some(item => item.status === "排队中" || item.status === "处理中");
-                const allDone = userTasks.length > 0 && !hasRunning;
-                if(allDone && !allTaskDonePrev){
-                    allTaskDonePrev = true;
-                    downloadZip();
-                }else if(!allDone){
-                    allTaskDonePrev = false;
-                }
                 
                 tasks.forEach(t => {
                     const isOwner = t.username === currentUser.username, isAdmin = currentUser.role === "admin";
@@ -614,7 +617,11 @@ async def serve_index():
                     }
                     if (t.status === "已完成") {
                         btn += `<button class="btn btn-success" onclick="downloadFile('${t.task_id}')">单文件下载</button>`;
-                        // 删除原有单任务自动下载逻辑
+                        
+                        if (isOwner && !autoDownloadedTasks.has(t.task_id)) {
+                            autoDownloadedTasks.add(t.task_id);
+                            downloadFile(t.task_id);
+                        }
                     }
                     tbody.innerHTML += `<tr><td>${t.task_id}</td><td><b>${t.username}</b></td><td>${t.filename}</td><td>${t.status}</td><td>${t.created_at}</td><td>${btn}</td></tr>`;
                 });
@@ -629,59 +636,22 @@ async def serve_index():
                 if(!confirm("确定要刷新并清除当前列表及服务器上的所有临时文件吗？")) return;
                 const res = await fetch('/api/tasks/clear', { method: "POST", headers: { "Authorization": `Bearer ${currentUser.token}` } });
                 if(res.ok) {
-                    allTaskDonePrev = false;
+                    autoDownloadedTasks.clear();
                     fetchTasks();
                 }
             }
 
-            async function downloadFile(id) {
-                try {
-                    const res = await fetch(`/api/tasks/${id}/download`, { headers: { "Authorization": `Bearer ${currentUser.token}` } });
-                    if (!res.ok) {
-                        const errData = await res.json().catch(() => ({}));
-                        return alert("下载失败: " + (errData.detail || "服务器未找到文件或权限不足，请刷新页面重试"));
-                    }
-                    const blob = await res.blob();
-                    const url = window.URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.style.display = 'none';
-                    a.href = url;
-                    a.download = `${id}.file`;
-                    document.body.appendChild(a);
-                    a.click();
-                    setTimeout(() => {
-                        document.body.removeChild(a);
-                        window.URL.revokeObjectURL(url);
-                    }, 1000);
-                } catch (e) {
-                    alert("网络异常或下载被浏览器拦截，请尝试使用 Chrome 浏览器！");
-                }
+            // 【完全采用浏览器原生直链调起，零拦截】
+            function downloadFile(id) {
+                const token = localStorage.getItem("token");
+                if(!token) return alert("身份校验已失效，请重新登录");
+                window.open(`/api/tasks/${id}/download?token=${token}`, '_blank');
             }
 
-            async function downloadZip() {
-                // 新增下载中提示
-                alert("下载中：正在生成全部已完成文件的压缩包，请耐心等待，不要关闭页面");
-                try {
-                    const res = await fetch('/api/tasks/download_zip', { headers: { "Authorization": `Bearer ${currentUser.token}` } });
-                    if (!res.ok) {
-                        const errData = await res.json().catch(() => ({}));
-                        return alert("打包失败: " + (errData.detail || "没有已完成的任务可供下载"));
-                    }
-                    const blob = await res.blob();
-                    const url = window.URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.style.display = 'none';
-                    a.href = url;
-                    a.download = `批量图片包_${new Date().getTime()}.zip`;
-                    document.body.appendChild(a);
-                    a.click();
-                    setTimeout(() => {
-                        document.body.removeChild(a);
-                        window.URL.revokeObjectURL(url);
-                    }, 1000);
-                } catch (e) {
-                    alert("网络异常或打包下载失败，请重试！");
-                }
+            function downloadZip() {
+                const token = localStorage.getItem("token");
+                if(!token) return alert("身份校验已失效，请重新登录");
+                window.open(`/api/tasks/download_zip?token=${token}`, '_blank');
             }
         </script>
     </body>
