@@ -348,3 +348,326 @@ async def serve_index():
             .toolbar { display: flex; justify-content: space-between; align-items: center; margin-top: 15px; }
             .form-box { background: #f9f9f9; padding: 15px; border-radius: 6px; margin-bottom: 15px; border: 1px dashed #ddd; }
         </style>
+    </head>
+    <body>
+        <div id="loginCard" class="card">
+            <h2>系统登录</h2>
+            <div style="margin-top: 15px;">
+                <input type="text" id="loginUsername" placeholder="请输入用户名">
+                <input type="password" id="loginPassword" placeholder="请输入密码">
+                <button class="btn btn-primary" onclick="login()">登录</button>
+            </div>
+        </div>
+
+        <div id="mainCard" class="card hidden">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h2>控制台 - 当前用户: <span id="userInfo"></span></h2>
+                <button class="btn btn-danger" onclick="logout()">退出登录</button>
+            </div>
+            <hr style="border:0; border-top:1px solid #eee; margin: 15px 0;">
+            
+            <h3>批量上传 JPEG 图片</h3>
+            <div>
+                <input type="file" id="imageFiles" accept=".jpg,.jpeg,.jpe,.jfif" multiple>
+                垃圾数据 (MB): <input type="number" id="junkSize" value="1.0" step="0.5" style="width:60px;">
+                <button id="submitBtn" class="btn btn-primary" onclick="submitBatchTasks()">开始批量处理</button>
+            </div>
+
+            <div class="toolbar" style="margin-top: 25px;">
+                <h3 style="margin: 0;">我的任务列表 (处理完成自动打包下载)</h3>
+                <div>
+                    <button id="zipBtn" class="btn btn-success" onclick="downloadZip()">📦 打包下载全部已完成 (.zip)</button>
+                    <button class="btn btn-warning" onclick="clearTasks()">🧹 刷新/清除我的记录</button>
+                </div>
+            </div>
+
+            <table>
+                <thead>
+                    <tr><th>任务 ID</th><th>所属用户</th><th>文件名</th><th>状态</th><th>创建时间</th><th>操作</th></tr>
+                </thead>
+                <tbody id="taskTableBody"></tbody>
+            </table>
+
+            <div id="adminPanel" class="hidden" style="margin-top: 30px; border-top: 2px dashed #0066cc; padding-top: 15px;">
+                <h3 style="color: #0066cc;">账号与设备锁管理（管理员专属面板）</h3>
+                <div class="form-box">
+                    <h4 style="margin-top: 0;">➕ 添加或修改账号密码</h4>
+                    <input type="text" id="newUsername" placeholder="用户名">
+                    <input type="password" id="newPassword" placeholder="设置密码">
+                    <select id="newRole">
+                        <option value="user">普通用户 (受设备限制)</option>
+                        <option value="admin">管理员 (无设备限制)</option>
+                    </select>
+                    <button class="btn btn-primary" onclick="saveUser()">保存账号</button>
+                </div>
+                <h4>系统已存账号列表</h4>
+                <table>
+                    <thead>
+                        <tr><th>用户名</th><th>角色</th><th>设备绑定状态</th><th>操作</th></tr>
+                    </thead>
+                    <tbody id="userTableBody"></tbody>
+                </table>
+                <h4 style="margin-top: 20px;">当前在线用户</h4>
+                <ul id="onlineUsersList" style="padding-left: 20px;"></ul>
+            </div>
+        </div>
+
+        <script>
+            let currentUser = null, pollInterval = null;
+            let hasAutoDownloadedZip = false; 
+
+            function getDeviceId() {
+                let deviceId = localStorage.getItem("system_device_fingerprint");
+                if (!deviceId) {
+                    deviceId = 'DEV-' + Math.random().toString(36).substring(2, 15) + '-' + new Date().getTime();
+                    localStorage.setItem("system_device_fingerprint", deviceId);
+                }
+                return deviceId;
+            }
+
+            window.onload = () => {
+                const token = localStorage.getItem("token");
+                if (token) {
+                    currentUser = { token, role: localStorage.getItem("role"), username: localStorage.getItem("username") };
+                    showMainUI();
+                }
+            };
+
+            async function login() {
+                const u = document.getElementById("loginUsername").value;
+                const p = document.getElementById("loginPassword").value;
+                if(!u || !p) return alert("请输入用户名和密码");
+
+                const deviceId = getDeviceId();
+                const body = new URLSearchParams({ username: u, password: p, device_id: deviceId });
+
+                const res = await fetch('/api/login', { method: "POST", body });
+                const data = await res.json();
+                
+                if (!res.ok) return alert("登录失败: " + data.detail);
+
+                currentUser = { token: data.access_token, role: data.role, username: data.username };
+                localStorage.setItem("token", data.access_token);
+                localStorage.setItem("role", data.role);
+                localStorage.setItem("username", data.username);
+                showMainUI();
+            }
+
+            function logout() {
+                localStorage.clear(); currentUser = null; clearInterval(pollInterval);
+                document.getElementById("loginCard").classList.remove("hidden");
+                document.getElementById("mainCard").classList.add("hidden");
+                document.getElementById("adminPanel").classList.add("hidden");
+            }
+
+            function showMainUI() {
+                document.getElementById("loginCard").classList.add("hidden");
+                document.getElementById("mainCard").classList.remove("hidden");
+                document.getElementById("userInfo").innerText = `${currentUser.username} (${currentUser.role === 'admin' ? '管理员' : '普通用户'})`;
+                
+                if (currentUser.role === 'admin') {
+                    document.getElementById("adminPanel").classList.remove("hidden");
+                    fetchAdminData();
+                } else {
+                    document.getElementById("adminPanel").classList.add("hidden");
+                }
+
+                fetchTasks();
+                clearInterval(pollInterval);
+                pollInterval = setInterval(() => {
+                    fetchTasks();
+                    if (currentUser && currentUser.role === 'admin') fetchAdminData();
+                }, 2000);
+            }
+
+            async function fetchAdminData() {
+                fetchOnlineUsers();
+                fetchUserList();
+            }
+
+            async function fetchUserList() {
+                if (!currentUser || currentUser.role !== 'admin') return;
+                const res = await fetch('/api/admin/users', { headers: { "Authorization": `Bearer ${currentUser.token}` } });
+                if (!res.ok) return;
+                const users = await res.json();
+                const tbody = document.getElementById("userTableBody");
+                tbody.innerHTML = "";
+                users.forEach(u => {
+                    let actions = "";
+                    if(u.is_bound) {
+                        actions += `<button class="btn btn-warning" style="padding:2px 8px; font-size:12px;" onclick="unbindDevice('${u.username}')">🔓 重置设备锁</button> `;
+                    }
+                    if(u.username !== 'admin') {
+                        actions += `<button class="btn btn-danger" style="padding:2px 8px; font-size:12px;" onclick="deleteUser('${u.username}')">🗑️ 删除账户</button>`;
+                    }
+                    tbody.innerHTML += `<tr>
+                        <td><b>${u.username}</b></td>
+                        <td>${u.role === 'admin' ? '<span style="color:red">管理员</span>' : '普通用户'}</td>
+                        <td>${u.is_bound ? '<span style="color:orange">🔒 已绑定设备</span>' : '<span style="color:green">🔓 未绑定 (可新登)</span>'}</td>
+                        <td>${actions}</td>
+                    </tr>`;
+                });
+            }
+
+            async function saveUser() {
+                const u = document.getElementById("newUsername").value;
+                const p = document.getElementById("newPassword").value;
+                const r = document.getElementById("newRole").value;
+                if(!u || !p) return alert("请填写完整的用户名和密码！");
+
+                const formData = new FormData();
+                formData.append("username", u);
+                formData.append("password", p);
+                formData.append("role", r);
+
+                const res = await fetch('/api/admin/save_user', { method: "POST", headers: { "Authorization": `Bearer ${currentUser.token}` }, body: formData });
+                const data = await res.json();
+                alert(data.message);
+                document.getElementById("newUsername").value = "";
+                document.getElementById("newPassword").value = "";
+                fetchUserList();
+            }
+
+            async function deleteUser(username) {
+                if(!confirm(`确定要彻底删除账号 ${username} 吗？`)) return;
+                const formData = new FormData();
+                formData.append("username", username);
+                const res = await fetch('/api/admin/delete_user', { method: "POST", headers: { "Authorization": `Bearer ${currentUser.token}` }, body: formData });
+                const data = await res.json();
+                alert(data.message);
+                fetchUserList();
+            }
+
+            async function fetchOnlineUsers() {
+                if (!currentUser || currentUser.role !== 'admin') return;
+                const res = await fetch('/api/admin/online-users', { headers: { "Authorization": `Bearer ${currentUser.token}` } });
+                if (!res.ok) return;
+                const data = await res.json();
+                const list = document.getElementById("onlineUsersList");
+                list.innerHTML = "";
+                data.online_users.forEach(user => {
+                    if(user !== 'admin') {
+                        list.innerHTML += `<li style="margin-bottom:8px;">用户：<b>${user}</b> <button class="btn btn-danger" style="padding:2px 8px; font-size:12px;" onclick="kickout('${user}')">强行下线</button></li>`;
+                    }
+                });
+            }
+
+            async function unbindDevice(username) {
+                if(!confirm(`确定要解锁用户 ${username} 的电脑绑定吗？`)) return;
+                const formData = new FormData();
+                formData.append("username", username);
+                const res = await fetch('/api/admin/unbind_device', { method: "POST", headers: { "Authorization": `Bearer ${currentUser.token}` }, body: formData });
+                const data = await res.json();
+                alert(data.message);
+                fetchUserList();
+            }
+
+            async function kickout(username) {
+                if(!confirm(`确定要强行踢出用户 ${username} 吗？`)) return;
+                const formData = new FormData();
+                formData.append("username", username);
+                const res = await fetch('/api/admin/kickout', { method: "POST", headers: { "Authorization": `Bearer ${currentUser.token}` }, body: formData });
+                const data = await res.json();
+                alert(data.message);
+                fetchOnlineUsers();
+            }
+
+            async function submitBatchTasks() {
+                const files = document.getElementById("imageFiles").files;
+                if (!files || files.length === 0) return alert("请至少选择一张图片！");
+
+                const btn = document.getElementById("submitBtn");
+                btn.innerText = "⏳ 批量上传与处理中...";
+                btn.disabled = true;
+
+                hasAutoDownloadedZip = false;
+
+                const formData = new FormData();
+                for(let i = 0; i < files.length; i++) formData.append("files", files[i]);
+                formData.append("junk_size_mb", document.getElementById("junkSize").value);
+
+                try {
+                    const res = await fetch('/api/tasks/create_batch', {
+                        method: "POST", headers: { "Authorization": `Bearer ${currentUser.token}` }, body: formData
+                    });
+                    if (res.ok) { 
+                        document.getElementById("imageFiles").value = "";
+                        fetchTasks(); 
+                    } else { alert("提交失败"); }
+                } catch(e) {
+                    alert("网络异常，提交失败");
+                } finally {
+                    btn.innerText = "开始批量处理";
+                    btn.disabled = false;
+                }
+            }
+
+            async function fetchTasks() {
+                if (!currentUser) return;
+                const res = await fetch('/api/tasks', { headers: { "Authorization": `Bearer ${currentUser.token}` } });
+                if (!res.ok) { if(res.status === 401) logout(); return; }
+                const tasks = await res.json();
+                const tbody = document.getElementById("taskTableBody");
+                tbody.innerHTML = "";
+                
+                let completedCount = tasks.filter(t => t.status === "已完成").length;
+
+                if (tasks.length > 0 && completedCount === tasks.length && !hasAutoDownloadedZip) {
+                    hasAutoDownloadedZip = true;
+                    downloadZip();
+                }
+
+                tasks.forEach(t => {
+                    const isRunning = t.status === "排队中" || t.status === "处理中";
+                    let btn = "";
+                    if (isRunning) {
+                        btn += `<button class="btn btn-danger" onclick="stopTask('${t.task_id}')">停止</button> `;
+                    }
+                    tbody.innerHTML += `<tr><td>${t.task_id}</td><td><b>${t.username}</b></td><td>${t.filename}</td><td>${t.status}</td><td>${t.created_at}</td><td>${btn}</td></tr>`;
+                });
+            }
+
+            async function stopTask(id) {
+                await fetch(`/api/tasks/${id}/stop`, { method: "POST", headers: { "Authorization": `Bearer ${currentUser.token}` } });
+                fetchTasks();
+            }
+
+            async function clearTasks() {
+                if(!confirm("确定要刷新并清除你的所有任务记录吗？")) return;
+                const res = await fetch('/api/tasks/clear', { method: "POST", headers: { "Authorization": `Bearer ${currentUser.token}` } });
+                if(res.ok) {
+                    hasAutoDownloadedZip = false;
+                    fetchTasks();
+                }
+            }
+
+            // 直接通过浏览器下载，避免 XHR 内存卡死
+            function downloadZip() {
+                const token = localStorage.getItem("token");
+                if(!token) return alert("身份校验已失效，请重新登录");
+                window.open(`/api/tasks/download_zip?token=${token}`, '_self');
+            }
+        </script>
+    </body>
+    </html>
+    """
+
+# ---------------- 5. 启动入口 ----------------
+if __name__ == "__main__":
+    import uvicorn
+    import webview
+    import webbrowser
+
+    def run_server():
+        uvicorn.run(app, host="127.0.0.1", port=8000, log_level="error")
+
+    threading.Thread(target=run_server, daemon=True).start()
+    time.sleep(1.5)
+
+    try:
+        webview.create_window("图片处理助手", "http://127.0.0.1:8000", width=1000, height=750)
+        webview.start()
+    except Exception:
+        webbrowser.open("http://127.0.0.1:8000")
+        while True:
+            time.sleep(1)
